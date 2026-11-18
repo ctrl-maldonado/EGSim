@@ -1,0 +1,75 @@
+# EGSim – Beispielkonfiguration (Datenvertrag 0.2)
+# Kopieren nach config.yaml und anpassen. ${VAR} bzw. ${VAR:-default} wird aus Umgebungsvariablen gelesen.
+
+platform:
+  baseUrl: ${EGSIM_BASE_URL:-http://localhost:8080}
+  timeoutSeconds: 10
+  verifyTls: true
+
+# Admin-Zugang (vom Betreiber konfiguriert). Nötig für provisioning.mode=register, closeMarket und die volle Ergebnisprüfung.
+admin:
+  apiKey: ${EGSIM_ADMIN_API_KEY}
+  # alternativ:
+  # email: ${EGSIM_ADMIN_EMAIL}
+  # password: ${EGSIM_ADMIN_PASSWORD}
+
+run:
+  seed: 42                    # gleicher Seed = gleiche Mengen und Preise (reproduzierbar)
+  deliveryDates: [tomorrow]   # today, tomorrow, +N oder YYYY-MM-DD; der Markt muss existieren
+  concurrency: 4              # parallele Requests
+  delayMs: [0, 50]            # zufällige Pause vor jedem Einreichen
+  closeMarket: false          # true: Admin schließt den Markt nach dem Einreichen (nur auf Testsystemen!)
+  settlementTimeoutSeconds: 60
+  verifyResults: true         # Ergebnisse gegen eigene Referenzrechnung prüfen (wenn Markt SETTLED)
+  checks: true                # Negativ-/Vertragstests (Fehlercodes, Rollen, Mandantentrennung)
+  lifecycleChecks: true       # Registrierung/Status/Login/Löschen mit einer Wegwerf-EG
+  onExistingPosition: skip    # skip | update – wenn die EG schon eine Position im Intervall hat
+  reportFile: reports/egsim-{timestamp}.json
+  failOnFindings: true        # Exit-Code 1 bei Abweichungen (für CI)
+  tolerance:
+    kwh: 0                    # erlaubte Abweichung bei Mengen
+    eur: 0                    # erlaubte Abweichung bei Beträgen
+
+provisioning:
+  mode: register              # register: EGs registrieren + per Admin freischalten | existing: vorhandene Zugangsdaten
+  auth: apiKey                # apiKey (X-API-Key) | bearer (Login mit E-Mail/Passwort)
+  emailDomain: egsim.example
+  stateFile: .egsim-state.json  # merkt sich registrierte EGs + Zugangsdaten für den nächsten Lauf (enthält Secrets!)
+
+behaviour:
+  updateProbability: 0.2      # Anteil der Positionen, die nach dem Einreichen geändert werden
+  updateChangePercent: 20     # Menge ändert sich um bis zu ±20 %
+  cancelProbability: 0.05     # Anteil der Positionen, die storniert werden
+  quarterHour:
+    intervals: all            # all | daylight | <Anzahl zufälliger Intervalle> (nur QUARTER_HOUR-Märkte)
+
+# Profile: solar, wind, flat, household, business, night
+# dailyKwh: feste Zahl oder [min, max] – Tagesmenge, im 15-Min-Markt nach Profil auf die Intervalle verteilt.
+# Hat eine EG generation UND consumption, meldet sie den Saldo (Angebot oder Bedarf).
+communities:
+  - name: EG Sonnenfeld
+    description: Photovoltaik-Gemeinschaft
+    generation: {profile: solar, dailyKwh: [80, 150]}
+    priceExpectation: {probability: 0.8, range: [0.07, 0.11], decimals: 3}
+
+  - name: EG Windpark Nord
+    generation: {profile: wind, dailyKwh: [40, 90], noise: 0.3}
+    priceExpectation: {probability: 1.0, range: [0.09, 0.13]}   # teils über dem Ankaufspreis → PRICE_NOT_MET
+
+  - name: EG Altstadt
+    consumption: {profile: household, dailyKwh: [100, 160]}
+
+  - name: Gewerbepark
+    count: 2                  # erzeugt "Gewerbepark #1" und "Gewerbepark #2"
+    consumption: {profile: business, dailyKwh: [60, 120]}
+
+  - name: EG Dorfmitte
+    description: Prosumer – PV und Haushalte
+    generation: {profile: solar, dailyKwh: [30, 70]}
+    consumption: {profile: household, dailyKwh: [40, 80]}
+    priceExpectation: {probability: 0.5, range: [0.08, 0.10]}
+
+# Beispiel für provisioning.mode: existing
+#  - name: EG Bestand
+#    apiKey: ${EG_BESTAND_API_KEY}
+#    generation: {profile: solar, dailyKwh: 100}
