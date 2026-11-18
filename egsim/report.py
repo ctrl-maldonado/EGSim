@@ -41,12 +41,12 @@ def format_summary(report: dict) -> str:
                      f"Angebot {m['offersKwh']} kWh, Bedarf {m['demandKwh']} kWh")
         v = m.get("verification")
         if v:
-            lines.append(f"  Ergebnisprüfung: {v['status']} ({v.get('comparisons', 0)} Vergleiche, "
-                         f"{v.get('mismatches', 0)} Abweichungen)")
+            lines.append(f"  Ergebnisprüfung ({'vollständig' if v.get('mode') == 'full' else 'EG-Sicht'}): {v['status']} "
+                         f"({v.get('comparisons', 0)} Vergleiche, {v.get('mismatches', 0)} Abweichungen)")
             ref = v.get("reference")
             if ref:
                 lines.append(f"  Referenz: Einkauf {ref['purchaseCostEur']} €, Verkauf {ref['salesRevenueEur']} €, "
-                             f"Reserve {ref['reserveRequiredKwh']} kWh / {ref['reserveCostEur']} €, Marge {ref['marginEur']} €")
+                             f"Reserve {ref['reserveDispatchedKwh']} kWh / {ref['reserveCostEur']} €, Marge {ref['marginEur']} €")
     lines.append(f"Checks: {t['checksPassed']} bestanden, {t['checksFailed']} fehlgeschlagen, {t['checksSkipped']} übersprungen")
     for c in report["checks"]:
         if c["result"] == "FAIL":

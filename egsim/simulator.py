@@ -1,7 +1,9 @@
-"""Ablaufsteuerung: EGs bereitstellen, Positionen einreichen/ändern/stornieren, Markt schließen, prüfen."""
+"""Ablaufsteuerung aus Sicht der EGs: anmelden, Positionen einreichen/ändern/stornieren, auf Settlement warten, prüfen.
+
+Der Simulator hat keinen Admin-Zugang. Er nutzt ausschließlich Endpoints, die die Rolle ENERGY_COMMUNITY darf.
+"""
 from __future__ import annotations
 
-import json
 import logging
 import random
 import re
@@ -11,7 +13,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from pathlib import Path
 from typing import Any
 
 from egsim import CONTRACT_VERSION, __version__
@@ -27,16 +28,18 @@ log = logging.getLogger("egsim")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
+class Stopped(Exception):
+    pass
+
+
 @dataclass
 class SimEG:
     key: str
     cfg: CommunityConfig
     id: str | None = None
-    email: str | None = None
-    api_key: str | None = None
-    password: str | None = None
     client: ApiClient | None = None
     status: str | None = None
+    problem: str | None = None
 
     @property
     def ready(self) -> bool:
@@ -65,12 +68,12 @@ class MarketRun:
     rejected_submissions: int = 0
     updates: int = 0
     cancels: int = 0
-    close_status: int | None = None
     final_status: str | None = None
     verification: dict | None = None
 
     def summary(self) -> dict:
         m = self.market or {}
+        live = [p for p in self.positions if p.id and not p.cancelled]
         return {
             "deliveryDate": self.delivery_date,
             "resolution": m.get("resolution"),
@@ -82,36 +85,36 @@ class MarketRun:
             "submissionsFailed": self.rejected_submissions,
             "updates": self.updates,
             "cancellations": self.cancels,
-            "offersKwh": str(sum((p.quantity or 0 for p in self.positions if p.id and not p.cancelled and p.planned.type == "OFFER"), Decimal(0))),
-            "demandKwh": str(sum((p.quantity or 0 for p in self.positions if p.id and not p.cancelled and p.planned.type == "DEMAND"), Decimal(0))),
-            "closeHttpStatus": self.close_status,
+            "offersKwh": str(sum((p.quantity or 0 for p in live if p.planned.type == "OFFER"), Decimal(0))),
+            "demandKwh": str(sum((p.quantity or 0 for p in live if p.planned.type == "DEMAND"), Decimal(0))),
             "marketStatusAtEnd": self.final_status,
             "verification": self.verification,
         }
 
 
-def _slug(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-") or "eg"
-
-
 class Simulator:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, *, stats: RequestStats | None = None, stop: threading.Event | None = None) -> None:
         self.cfg = cfg
-        self.stats = RequestStats()
+        self.stats = stats or RequestStats()
+        self.stop = stop or threading.Event()
         self.findings = Findings()
         self.run_id = now_utc().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:4]
         self.seed = cfg.seed if cfg.seed is not None else random.randrange(1_000_000)
-        self.base = ApiClient(cfg.base_url, stats=self.stats, timeout=cfg.timeout, verify_tls=cfg.verify_tls, label="anon")
-        self.admin: ApiClient | None = None
+        self.base = ApiClient(cfg.base_url, stats=self.stats, timeout=cfg.timeout, verify_tls=cfg.verify_tls, label="anonym")
         self.egs: list[SimEG] = []
         self.markets: list[MarketRun] = []
         self.check_results: list[dict] = []
-        self._state: dict = {}
         self.started_at = now_utc()
+        self.mode = "run"
+        self.stopped = False
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ util
-    def _inc(self, run: "MarketRun", attr: str) -> None:
+    def _check_stop(self) -> None:
+        if self.stop.is_set():
+            raise Stopped()
+
+    def _inc(self, run: MarketRun, attr: str) -> None:
         with self._lock:
             setattr(run, attr, getattr(run, attr) + 1)
 
@@ -131,196 +134,171 @@ class Simulator:
                             resp.short())
         return False
 
-    # ------------------------------------------------------------ state file
-    def _load_state(self) -> None:
-        sf = self.cfg.state_file
-        if not sf or not Path(sf).exists():
-            return
-        try:
-            data = json.loads(Path(sf).read_text(encoding="utf-8"))
-        except ValueError:
-            self.findings.warning("provisioning", f"State-Datei {sf} ist kein gültiges JSON, wird ignoriert")
-            return
-        if data.get("baseUrl") == self.cfg.base_url:
-            self._state = data.get("communities", {})
-
-    def _save_state(self) -> None:
-        sf = self.cfg.state_file
-        if not sf or self.cfg.provisioning_mode != "register":
-            return
-        comms = dict(self._state)
-        for eg in self.egs:
-            if eg.id and eg.api_key:
-                comms[eg.key] = {"id": eg.id, "email": eg.email, "apiKey": eg.api_key, "password": eg.password}
-        Path(sf).parent.mkdir(parents=True, exist_ok=True)
-        Path(sf).write_text(json.dumps({"baseUrl": self.cfg.base_url, "communities": comms}, indent=2), encoding="utf-8")
-
-    # ------------------------------------------------------------- admin/auth
-    def _client_for(self, label: str, api_key: str | None, email: str | None, password: str | None,
-                    prefer: str) -> tuple[ApiClient | None, ApiResponse | None]:
-        if prefer == "bearer" and email and password or (not api_key and email and password):
-            r = self.base.login(email, password)
-            if r.status == 200 and isinstance(r.body, dict) and r.body.get("token"):
-                return self.base.with_auth(token=r.body["token"], label=label), r
-            return None, r
-        if api_key:
-            return self.base.with_auth(api_key=api_key, label=label), None
-        return None, None
-
-    def setup_admin(self) -> None:
-        if not self.cfg.has_admin:
-            log.info("Kein Admin-Zugang konfiguriert – Admin-Schritte werden übersprungen")
-            return
-        client, login = self._client_for("admin", self.cfg.admin_api_key, self.cfg.admin_email, self.cfg.admin_password,
-                                         "apiKey" if self.cfg.admin_api_key else "bearer")
-        if client is None:
-            self.findings.error("admin", "Admin-Login fehlgeschlagen", login.short() if login else None)
-            return
-        me = client.me()
-        if me.status != 200 or not isinstance(me.body, dict) or me.body.get("role") != "ADMIN":
-            self.findings.error("admin", f"GET /me liefert für Admin-Zugang nicht role=ADMIN: {me.body}", me.short())
-            return
-        self.admin = client
-        log.info("Admin-Zugang ok")
-
-    # ----------------------------------------------------------- provisioning
-    def provision(self) -> None:
-        self._load_state()
-        for c in self.cfg.communities:
-            for n in range(1, c.count + 1):
-                key = c.name if c.count == 1 else f"{c.name} #{n}"
-                eg = SimEG(key=key, cfg=c)
-                self.egs.append(eg)
+    def _map(self, fn, items) -> None:
+        def guarded(x):
+            if not self.stop.is_set():
+                fn(x)
         with ThreadPoolExecutor(self.cfg.concurrency) as ex:
-            list(ex.map(self._provision_one, self.egs))
-        self._save_state()
+            list(ex.map(guarded, items))
+        self._check_stop()
+
+    # ------------------------------------------------------------- EG-Zugang
+    def connect(self) -> None:
+        for c in self.cfg.active_communities:
+            self.egs.append(SimEG(key=c.name, cfg=c))
+        self._map(self._connect_one, self.egs)
         ready = sum(1 for e in self.egs if e.ready)
-        log.info("%d/%d EGs einsatzbereit", ready, len(self.egs))
-        if ready == 0:
-            self.findings.error("provisioning", "Keine EG einsatzbereit – Lauf kann keine Positionen einreichen")
+        log.info("%d/%d EGs angemeldet", ready, len(self.egs))
+        if not self.egs:
+            self.findings.error("setup", "Keine aktive EG konfiguriert")
+        elif ready == 0:
+            self.findings.error("setup", "Keine EG konnte sich anmelden – Zugangsdaten prüfen")
 
-    def _provision_one(self, eg: SimEG) -> None:
-        if self.cfg.provisioning_mode == "existing":
-            eg.api_key, eg.email, eg.password = eg.cfg.api_key, eg.cfg.email, eg.cfg.password
-            self._attach_client(eg)
+    def _connect_one(self, eg: SimEG) -> None:
+        c = eg.cfg
+        if not c.has_credentials:
+            eg.problem = "keine Zugangsdaten"
+            self.findings.warning("setup", f"[{eg.key}] keine Zugangsdaten hinterlegt – EG wird übersprungen. "
+                                           "Nach der Registrierung schaltet der Admin der Plattform die EG frei und "
+                                           "übergibt API-Key und Passwort.")
             return
-        st = self._state.get(eg.key)
-        if st:
-            eg.id, eg.email, eg.api_key, eg.password = st.get("id"), st.get("email"), st.get("apiKey"), st.get("password")
-            if self._attach_client(eg, quiet=True):
-                log.info("[%s] aus State-Datei wiederverwendet (%s)", eg.key, eg.id)
+        if c.auth == "bearer":
+            r = self.base.login(c.email, c.password)
+            if r.status != 200 or not isinstance(r.body, dict) or not r.body.get("token"):
+                eg.problem = f"Login {r.status} {r.code or ''}".strip()
+                self._login_problem(eg, r)
                 return
-            log.info("[%s] Zugang aus State-Datei ungültig – registriere neu bzw. vergebe neue Zugangsdaten", eg.key)
-            if eg.id and self.admin and self.admin.get_community(eg.id).status == 200:
-                self._activate_and_issue(eg)
-                return
-        self._register(eg)
-
-    def _register(self, eg: SimEG) -> None:
-        eg.email = f"egsim-{_slug(eg.key)}-{self.run_id}@{self.cfg.email_domain}"
-        r = self.base.register(eg.email, eg.key[:120], eg.cfg.description or "Simulierte EG (EGSim)")
-        if not self._expect(r, (201,), "provisioning", f"[{eg.key}] Registrierung"):
-            return
-        body = r.body or {}
-        eg.id = body.get("id")
-        if body.get("status") != "PENDING":
-            self.findings.error("provisioning", f"[{eg.key}] neue EG hat Status {body.get('status')}, erwartet PENDING", r.short())
-        if not eg.id or not UUID_RE.match(str(eg.id)):
-            self.findings.error("provisioning", f"[{eg.key}] Registrierung liefert keine gültige UUID als id", r.short())
-            return
-        self._activate_and_issue(eg)
-
-    def _activate_and_issue(self, eg: SimEG) -> None:
-        if not self.admin:
-            self.findings.error("provisioning", f"[{eg.key}] kein Admin-Zugang zum Freischalten")
-            return
-        r = self.admin.set_status(eg.id, "ACTIVE")
-        if self._expect(r, (200,), "provisioning", f"[{eg.key}] Freischalten") and (r.body or {}).get("status") != "ACTIVE":
-            self.findings.error("provisioning", f"[{eg.key}] Status nach Freischalten {(r.body or {}).get('status')}", r.short())
-        r = self.admin.issue_credentials(eg.id)
-        if not self._expect(r, (201,), "provisioning", f"[{eg.key}] Zugangsdaten vergeben"):
-            return
-        eg.api_key, eg.password = (r.body or {}).get("apiKey"), (r.body or {}).get("password")
-        if not eg.api_key or not eg.password:
-            self.findings.error("provisioning", f"[{eg.key}] Antwort enthält nicht apiKey und password", r.short())
-        elif len(eg.password) < 8:
-            self.findings.warning("provisioning", f"[{eg.key}] generiertes Passwort kürzer als 8 Zeichen")
-        self._attach_client(eg)
-
-    def _attach_client(self, eg: SimEG, quiet: bool = False) -> bool:
-        client, login = self._client_for(eg.key, eg.api_key, eg.email, eg.password, self.cfg.auth)
-        if client is None:
-            if not quiet:
-                self.findings.error("provisioning", f"[{eg.key}] Anmeldung fehlgeschlagen", login.short() if login else None)
-            return False
+            if r.body.get("tokenType") != "Bearer" or r.body.get("role") != "ENERGY_COMMUNITY":
+                self.findings.error("response", f"[{eg.key}] Login-Antwort: tokenType={r.body.get('tokenType')}, "
+                                                f"role={r.body.get('role')}", r.short())
+            client = self.base.with_auth(token=r.body["token"], label=eg.key)
+        else:
+            client = self.base.with_auth(api_key=c.api_key, label=eg.key)
         me = client.me()
         if me.status != 200:
-            if not quiet:
-                self.findings.error("provisioning", f"[{eg.key}] GET /me fehlgeschlagen", me.short())
-            return False
+            eg.problem = f"GET /me {me.status} {me.code or ''}".strip()
+            self._login_problem(eg, me)
+            return
         body = me.body or {}
         ec = body.get("energyCommunity") or {}
-        if body.get("role") != "ENERGY_COMMUNITY":
-            self.findings.error("provisioning", f"[{eg.key}] GET /me liefert role={body.get('role')}", me.short())
-            return False
-        if eg.id and ec.get("id") != eg.id:
-            self.findings.error("provisioning", f"[{eg.key}] GET /me liefert fremde EG {ec.get('id')}", me.short())
-            return False
-        eg.id = ec.get("id") or eg.id
-        eg.status = ec.get("status")
-        eg.client = client
-        return True
+        if body.get("role") != "ENERGY_COMMUNITY" or not ec.get("id"):
+            eg.problem = f"role={body.get('role')}"
+            self.findings.error("setup", f"[{eg.key}] GET /me liefert role={body.get('role')} ohne energyCommunity – "
+                                         "der Simulator braucht EG-Zugangsdaten, keinen Admin-Key", me.short())
+            return
+        if c.energy_community_id and ec["id"] != c.energy_community_id:
+            self.findings.warning("setup", f"[{eg.key}] Zugangsdaten gehören zu EG {ec['id']}, eingetragen ist "
+                                           f"{c.energy_community_id}", me.short())
+        if ec.get("status") != "ACTIVE":
+            self.findings.error("response", f"[{eg.key}] GET /me liefert Status {ec.get('status')} statt 403 "
+                                            "für eine nicht aktive EG", me.short())
+        eg.id, eg.status, eg.client = ec["id"], ec.get("status"), client
+
+    def _login_problem(self, eg: SimEG, r: ApiResponse) -> None:
+        if r.code == "ENERGY_COMMUNITY_NOT_ACTIVE":
+            self.findings.warning("setup", f"[{eg.key}] EG ist noch nicht freigeschaltet (PENDING oder SUSPENDED)", r.short())
+        elif r.status == 401:
+            self.findings.error("setup", f"[{eg.key}] Zugangsdaten ungültig ({r.code})", r.short())
+        else:
+            self.findings.error("setup", f"[{eg.key}] Anmeldung fehlgeschlagen", r.short())
+
+    def reader(self) -> ApiClient | None:
+        return next((e.client for e in self.egs if e.ready), None)
 
     # ---------------------------------------------------------------- market
     def run_market(self, delivery: str) -> MarketRun:
         run = MarketRun(delivery)
         self.markets.append(run)
-        reader = self.admin or next((e.client for e in self.egs if e.ready), None)
+        reader = self.reader()
         if reader is None:
-            self.findings.error("market", f"{delivery}: kein angemeldeter Client verfügbar")
             return run
         r = reader.get_market(delivery)
         if r.status == 404:
-            self.findings.error("market", f"Für {delivery} existiert kein Markt (404). Der Betreiber muss ihn anlegen.", r.short())
+            self.findings.error("market", f"Für {delivery} existiert kein Markt (404 {r.code}). "
+                                          "Der Betreiber muss ihn anlegen.", r.short())
             return run
         if not self._expect(r, (200,), "market", f"Markt {delivery} abrufen"):
             return run
         run.market = m = r.body
+        self._validate_market(m, delivery, r)
         res = m.get("resolution")
         if res not in ("DAY", "QUARTER_HOUR"):
-            self.findings.error("market", f"{delivery}: unbekannte resolution {res}", r.short())
             return run
         log.info("Markt %s: %s, Status %s, Preise %s, closesAt %s", delivery, res, m.get("status"),
                  {k: str(v) for k, v in (m.get("prices") or {}).items() if k != "deliveryDate"}, m.get("closesAt"))
 
         closes_at = parse_ts(m["closesAt"]) if m.get("closesAt") else None
         open_for_orders = m.get("status") == "OPEN" and (closes_at is None or now_utc() < closes_at)
-        if open_for_orders:
+        if open_for_orders and self.cfg.submit_positions:
             self._submit_all(run)
             self._update_some(run)
             self._cancel_some(run)
-        else:
+        elif not open_for_orders:
             self.findings.info("market", f"{delivery}: Markt nimmt keine Positionen an (Status {m.get('status')}, "
                                          f"closesAt {m.get('closesAt')}) – Einreichen übersprungen")
 
-        from egsim import checks  # lazy, um Zyklen zu vermeiden
+        from egsim import checks
         if self.cfg.checks and open_for_orders:
+            self._check_stop()
             self.check_results += checks.run_open_market_checks(self, run)
 
-        if self.cfg.close_market and self.admin and m.get("status") in ("OPEN", "CLOSED", "FAILED"):
-            self._close(run)
+        run.final_status = m.get("status")
+        if self.cfg.wait_for_settlement_minutes > 0 and run.final_status != "SETTLED":
+            self._wait_for_settlement(run, reader)
         else:
             cur = reader.get_market(delivery)
-            run.final_status = (cur.body or {}).get("status") if cur.status == 200 else None
+            run.final_status = (cur.body or {}).get("status") if cur.status == 200 else run.final_status
 
         if run.final_status in ("CLOSED", "SETTLED", "FAILED") and self.cfg.checks:
             self.check_results += checks.run_closed_market_checks(self, run)
-
         if run.final_status == "SETTLED" and self.cfg.verify_results:
             from egsim.verify import verify_market
             run.verification = verify_market(self, run)
+        elif self.cfg.verify_results:
+            self.findings.info("verify", f"{delivery}: Markt ist {run.final_status} – Ergebnisprüfung erst nach dem "
+                                         "Settlement möglich (später mit „Ergebnisse prüfen“)")
         return run
 
+    def _validate_market(self, m: dict, delivery: str, r: ApiResponse) -> None:
+        problems = []
+        if m.get("deliveryDate") != delivery:
+            problems.append(f"deliveryDate={m.get('deliveryDate')}")
+        if m.get("resolution") not in ("DAY", "QUARTER_HOUR"):
+            problems.append(f"resolution={m.get('resolution')}")
+        if m.get("status") not in ("OPEN", "CLOSED", "SETTLED", "FAILED"):
+            problems.append(f"status={m.get('status')}")
+        if not isinstance(m.get("prices"), dict):
+            problems.append("prices fehlt")
+        if not m.get("closesAt"):
+            problems.append("closesAt fehlt")
+        if problems:
+            self.findings.error("response", f"Markt {delivery} weicht vom Schema ab: " + "; ".join(problems), r.short())
+
+    def _wait_for_settlement(self, run: MarketRun, reader: ApiClient) -> None:
+        deadline = time.monotonic() + self.cfg.wait_for_settlement_minutes * 60
+        log.info("%s: warte bis zu %.0f min auf Marktschluss und Settlement durch den Betreiber …",
+                 run.delivery_date, self.cfg.wait_for_settlement_minutes)
+        last = None
+        while True:
+            g = reader.get_market(run.delivery_date)
+            status = (g.body or {}).get("status") if g.status == 200 else None
+            if status != last:
+                log.info("%s: Marktstatus %s", run.delivery_date, status)
+                last = status
+            run.final_status = status or run.final_status
+            if status in ("SETTLED", "FAILED"):
+                if status == "FAILED":
+                    self.findings.error("market", f"Settlement FAILED: {(g.body or {}).get('failureReason')}", g.short())
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self.stop.wait(min(10, remaining)):
+                raise Stopped()
+        self.findings.warning("market", f"{run.delivery_date}: nach {self.cfg.wait_for_settlement_minutes:g} min "
+                                        f"nicht abgewickelt (Status {run.final_status})")
+
+    # ------------------------------------------------------------- Positionen
     def _plan(self, run: MarketRun) -> None:
         res = run.market["resolution"]
         d = resolve_delivery_date(run.delivery_date)
@@ -332,20 +310,16 @@ class Simulator:
             ivs = select_intervals(all_iv, self.cfg.quarter_hour_intervals, rng) if all_iv else None
             for p in plan_positions(eg.cfg, res, ivs, all_iv, rng):
                 run.positions.append(SubmittedPosition(eg=eg, planned=p))
-        log.info("%s: %d Positionen geplant (%d EGs)", run.delivery_date, len(run.positions),
-                 sum(1 for e in self.egs if e.ready))
+        log.info("%s: %d Positionen geplant", run.delivery_date, len(run.positions))
 
     def _submit_all(self, run: MarketRun) -> None:
         self._plan(run)
-        with ThreadPoolExecutor(self.cfg.concurrency) as ex:
-            list(ex.map(lambda sp: self._submit(run, sp), run.positions))
+        self._map(lambda sp: self._submit(run, sp), run.positions)
         log.info("%s: %d/%d Positionen angenommen", run.delivery_date, run.submitted, len(run.positions))
 
     def _submit(self, run: MarketRun, sp: SubmittedPosition) -> None:
-        rng = self._rng("delay", sp.eg.key, sp.planned.interval_start)
-        self._sleep(rng)
-        body = sp.planned.body(run.delivery_date)
-        r = sp.eg.client.submit_position(body)
+        self._sleep(self._rng("delay", sp.eg.key, sp.planned.interval_start))
+        r = sp.eg.client.submit_position(sp.planned.body(run.delivery_date))
         if r.status == 409 and r.code == "POSITION_ALREADY_EXISTS":
             self._handle_existing(run, sp, r)
             return
@@ -354,29 +328,29 @@ class Simulator:
             return
         self._accept(run, sp, r.body or {}, r)
 
-    def _accept(self, run: MarketRun, sp: SubmittedPosition, b: dict, r: ApiResponse, expected_status: str = "OPEN") -> None:
+    def _accept(self, run: MarketRun, sp: SubmittedPosition, b: dict, r: ApiResponse) -> None:
         sp.id, sp.status, sp.created_at = b.get("id"), b.get("status"), b.get("createdAt")
         sp.quantity = D(b.get("quantityKwh"))
         sp.price_expectation = D(b.get("priceExpectationEurPerKwh"))
         self._inc(run, "submitted")
-        self.validate_position_body(sp, b, run.delivery_date, r, expected_status)
+        self.validate_position_body(sp, b, run.delivery_date, r)
 
     def _handle_existing(self, run: MarketRun, sp: SubmittedPosition, r: ApiResponse) -> None:
         if self.cfg.on_existing_position == "skip":
             self.findings.info("submit", f"[{sp.eg.key}] Position existiert bereits für {run.delivery_date} "
                                          f"{sp.planned.interval_start or ''} – übersprungen", r.short())
             return
-        lst = sp.eg.client.list_positions(deliveryDate=run.delivery_date, intervalStart=sp.planned.interval_start, status="OPEN")
+        lst = sp.eg.client.list_positions(deliveryDate=run.delivery_date, intervalStart=sp.planned.interval_start,
+                                          status="OPEN")
         existing = (lst.body or []) if lst.status == 200 else []
         if not existing:
             self.findings.warning("submit", f"[{sp.eg.key}] 409 POSITION_ALREADY_EXISTS, aber keine OPEN-Position gefunden",
                                   lst.short())
             return
         pos = existing[0]
-        if pos.get("type") != sp.planned.type:
-            # Typ lässt sich per PUT nicht ändern: stornieren und neu einreichen
-            c = sp.eg.client.cancel_position(pos["id"])
-            if c.status == 200:
+        sp.updated = True
+        if pos.get("type") != sp.planned.type:  # Typ ist per PUT nicht änderbar
+            if sp.eg.client.cancel_position(pos["id"]).status == 200:
                 r2 = sp.eg.client.submit_position(sp.planned.body(run.delivery_date))
                 if self._expect(r2, (201,), "submit", f"[{sp.eg.key}] Neu einreichen nach Storno"):
                     self._accept(run, sp, r2.body or {}, r2)
@@ -387,11 +361,8 @@ class Simulator:
         u = sp.eg.client.update_position(pos["id"], body)
         if self._expect(u, (200,), "submit", f"[{sp.eg.key}] bestehende Position aktualisieren"):
             self._accept(run, sp, u.body or {}, u)
-            sp.updated = True
 
-    def validate_position_body(self, sp: SubmittedPosition, b: dict, delivery: str, r: ApiResponse,
-                               expected_status: str) -> None:
-        who = f"[{sp.eg.key}]"
+    def validate_position_body(self, sp: SubmittedPosition, b: dict, delivery: str, r: ApiResponse) -> None:
         problems = []
         if not b.get("id") or not UUID_RE.match(str(b.get("id"))):
             problems.append("id ist keine UUID")
@@ -405,12 +376,17 @@ class Simulator:
             problems.append(f"intervalStart={b.get('intervalStart')} statt {sp.planned.interval_start}")
         if b.get("type") != sp.planned.type:
             problems.append(f"type={b.get('type')}")
-        if b.get("status") != expected_status:
-            problems.append(f"status={b.get('status')} statt {expected_status}")
+        if D(b.get("quantityKwh")) != sp.planned.quantity:
+            problems.append(f"quantityKwh={b.get('quantityKwh')} statt {sp.planned.quantity}")
+        if D(b.get("priceExpectationEurPerKwh")) != sp.planned.price_expectation:
+            problems.append(f"priceExpectationEurPerKwh={b.get('priceExpectationEurPerKwh')} "
+                            f"statt {sp.planned.price_expectation}")
+        if b.get("status") != "OPEN":
+            problems.append(f"status={b.get('status')} statt OPEN")
         if not b.get("createdAt") or not b.get("updatedAt"):
             problems.append("createdAt/updatedAt fehlen")
         if problems:
-            self.findings.error("response", f"{who} Positionsantwort weicht ab: " + "; ".join(problems), r.short())
+            self.findings.error("response", f"[{sp.eg.key}] Positionsantwort weicht ab: " + "; ".join(problems), r.short())
 
     def _update_some(self, run: MarketRun) -> None:
         if self.cfg.update_probability <= 0:
@@ -435,15 +411,15 @@ class Simulator:
                 if D(b.get("quantityKwh")) != body["quantityKwh"]:
                     self.findings.error("update", f"[{sp.eg.key}] quantityKwh nach PUT {b.get('quantityKwh')} "
                                                   f"statt {body['quantityKwh']}", r.short())
+                if D(b.get("priceExpectationEurPerKwh")) != body.get("priceExpectationEurPerKwh"):
+                    self.findings.error("update", f"[{sp.eg.key}] Preisvorstellung nach PUT "
+                                                  f"{b.get('priceExpectationEurPerKwh')}", r.short())
                 if b.get("createdAt") != sp.created_at:
                     self.findings.warning("update", f"[{sp.eg.key}] createdAt hat sich durch PUT geändert "
-                                                    "(relevant für Rundungsreihenfolge)", r.short())
-                sp.quantity = D(b.get("quantityKwh"))
-                sp.updated = True
+                                                    "(relevant für die Rundungsreihenfolge)", r.short())
+                sp.quantity, sp.updated = D(b.get("quantityKwh")), True
                 self._inc(run, "updates")
-
-        with ThreadPoolExecutor(self.cfg.concurrency) as ex:
-            list(ex.map(do, todo))
+        self._map(do, todo)
 
     def _cancel_some(self, run: MarketRun) -> None:
         if self.cfg.cancel_probability <= 0:
@@ -456,77 +432,138 @@ class Simulator:
             r = sp.eg.client.cancel_position(sp.id)
             if self._expect(r, (200,), "cancel", f"[{sp.eg.key}] Position stornieren"):
                 if (r.body or {}).get("status") != "CANCELLED":
-                    self.findings.error("cancel", f"[{sp.eg.key}] Status nach Storno {(r.body or {}).get('status')}", r.short())
+                    self.findings.error("cancel", f"[{sp.eg.key}] Status nach Storno {(r.body or {}).get('status')}",
+                                        r.short())
                 sp.cancelled, sp.status = True, "CANCELLED"
                 self._inc(run, "cancels")
-
-        with ThreadPoolExecutor(self.cfg.concurrency) as ex:
-            list(ex.map(do, todo))
-
-    def _close(self, run: MarketRun) -> None:
-        r = self.admin.close_market(run.delivery_date)
-        run.close_status = r.status
-        if not self._expect(r, (200, 202), "close", f"Markt {run.delivery_date} schließen"):
-            return
-        status = (r.body or {}).get("status")
-        if r.status == 200 and status != "SETTLED":
-            self.findings.error("close", f"close antwortet 200, Status aber {status} (erwartet SETTLED)", r.short())
-        if r.status == 202 and status != "CLOSED":
-            self.findings.error("close", f"close antwortet 202, Status aber {status} (erwartet CLOSED)", r.short())
-        deadline = time.monotonic() + self.cfg.settlement_timeout
-        while status not in ("SETTLED", "FAILED") and time.monotonic() < deadline:
-            time.sleep(1)
-            g = self.admin.get_market(run.delivery_date)
-            status = (g.body or {}).get("status") if g.status == 200 else status
-        run.final_status = status
-        if status == "FAILED":
-            g = self.admin.get_market(run.delivery_date)
-            self.findings.error("close", f"Settlement FAILED: {(g.body or {}).get('failureReason')}")
-        elif status != "SETTLED":
-            self.findings.error("close", f"Settlement nach {self.cfg.settlement_timeout:.0f}s nicht abgeschlossen (Status {status})")
-        else:
-            log.info("Markt %s abgewickelt (SETTLED)", run.delivery_date)
+        self._map(do, todo)
 
     # ------------------------------------------------------------------- run
-    def run(self) -> dict:
-        h = self.base.health_ready()
-        if h.status != 200:
-            self.findings.warning("health", f"/health/ready liefert {h.status}", h.short())
-        self.setup_admin()
-        self.provision()
+    def _dates(self) -> list[str]:
+        out = []
         for spec in self.cfg.delivery_dates:
             try:
-                d = resolve_delivery_date(spec).isoformat()
+                out.append(resolve_delivery_date(spec).isoformat())
             except ValueError as exc:
                 self.findings.error("config", str(exc))
-                continue
-            self.run_market(d)
-        if self.cfg.checks and self.cfg.lifecycle_checks and self.admin and self.cfg.provisioning_mode == "register":
-            from egsim import checks
-            self.check_results += checks.run_lifecycle_checks(self)
+        return out
+
+    def run(self) -> dict:
+        try:
+            h = self.base.health_ready()
+            if h.status != 200:
+                self.findings.warning("health", f"/health/ready liefert {h.status or h.error}", h.short())
+            self.connect()
+            for d in self._dates():
+                self._check_stop()
+                self.run_market(d)
+            if self.cfg.checks:
+                from egsim import checks
+                self._check_stop()
+                self.check_results += checks.run_account_checks(self)
+        except Stopped:
+            self.stopped = True
+            self.findings.warning("run", "Lauf wurde abgebrochen")
+        return self.report()
+
+    def verify_only(self) -> dict:
+        """Nur Ergebnisse abholen und prüfen (z. B. nachdem der Betreiber den Markt geschlossen hat)."""
+        self.mode = "verify"
+        from egsim.verify import verify_market
+        try:
+            self.connect()
+            reader = self.reader()
+            for d in self._dates():
+                self._check_stop()
+                run = MarketRun(d)
+                self.markets.append(run)
+                if not reader:
+                    break
+                r = reader.get_market(d)
+                if r.status != 200:
+                    self.findings.error("market", f"Markt {d} abrufen: {r.status} {r.code or ''}", r.short())
+                    continue
+                run.market = r.body
+                run.final_status = (r.body or {}).get("status")
+                if run.final_status == "SETTLED":
+                    run.verification = verify_market(self, run)
+                else:
+                    self.findings.info("verify", f"{d}: Markt ist {run.final_status}, noch nicht abgewickelt")
+        except Stopped:
+            self.stopped = True
         return self.report()
 
     def report(self) -> dict:
-        failed_checks = [c for c in self.check_results if c["result"] == "FAIL"]
+        summary = self.stats.summary()
         return {
             "egsimVersion": __version__,
             "contractVersion": CONTRACT_VERSION,
+            "mode": self.mode,
             "runId": self.run_id,
             "seed": self.seed,
             "baseUrl": self.cfg.base_url,
             "startedAt": self.started_at.isoformat(),
             "finishedAt": now_utc().isoformat(),
-            "communities": [{"name": e.key, "id": e.id, "ready": e.ready} for e in self.egs],
+            "stopped": self.stopped,
+            "communities": [{"name": e.key, "id": e.id, "ready": e.ready, "status": e.status, "problem": e.problem}
+                            for e in self.egs],
             "markets": [m.summary() for m in self.markets],
             "checks": self.check_results,
             "findings": self.findings.as_list(),
-            "requests": self.stats.summary(),
+            "requests": summary,
             "totals": {
                 "errors": self.findings.count("error"),
                 "warnings": self.findings.count("warning"),
                 "checksPassed": sum(1 for c in self.check_results if c["result"] == "PASS"),
-                "checksFailed": len(failed_checks),
+                "checksFailed": sum(1 for c in self.check_results if c["result"] == "FAIL"),
                 "checksSkipped": sum(1 for c in self.check_results if c["result"] == "SKIP"),
-                "requests": sum(x["requests"] for x in self.stats.summary()),
+                "requests": sum(x["requests"] for x in summary),
             },
         }
+
+
+def register_community(base_url: str, name: str, email: str, description: str | None, *,
+                       timeout: float = 10, verify_tls: bool = True, stats: RequestStats | None = None) -> ApiResponse:
+    """Selbstregistrierung (POST /energy-communities, ohne Anmeldung). Danach Status PENDING."""
+    client = ApiClient(base_url, stats=stats or RequestStats(), timeout=timeout, verify_tls=verify_tls, label=name)
+    return client.register(email, name, description)
+
+
+def eg_client(cfg: Config, community: CommunityConfig, stats: RequestStats) -> tuple[ApiClient | None, ApiResponse | None]:
+    """Angemeldeter Client für eine EG (für manuelle Requests in der UI)."""
+    base = ApiClient(cfg.base_url, stats=stats, timeout=cfg.timeout, verify_tls=cfg.verify_tls, label=community.name)
+    if not community.has_credentials:
+        return None, None
+    if community.auth == "bearer":
+        r = base.login(community.email, community.password)
+        if r.status == 200 and isinstance(r.body, dict) and r.body.get("token"):
+            return base.with_auth(token=r.body["token"]), r
+        return None, r
+    return base.with_auth(api_key=community.api_key), None
+
+
+def test_connection(cfg: Config, community: CommunityConfig, stats: RequestStats | None = None) -> dict:
+    """Health-Check, Anmeldung und GET /me für eine EG – für den Button „Verbindung testen“."""
+    stats = stats or RequestStats()
+    base = ApiClient(cfg.base_url, stats=stats, timeout=cfg.timeout, verify_tls=cfg.verify_tls, label=community.name)
+    steps: list[dict] = []
+    out: dict = {"steps": steps, "ok": False}
+    h = base.health_ready()
+    steps.append({"step": "GET /health/ready", "status": h.status, "ok": h.status == 200,
+                  "detail": h.error or (h.body if isinstance(h.body, dict) else None)})
+    if not community.has_credentials:
+        steps.append({"step": "Anmeldung", "ok": False, "detail": "keine Zugangsdaten hinterlegt"})
+        return out
+    client, login = eg_client(cfg, community, stats)
+    if login is not None:
+        steps.append({"step": "POST /auth/login", "status": login.status, "ok": client is not None, "detail": login.code})
+    if client is None:
+        return out
+    me = client.me()
+    body = me.body if isinstance(me.body, dict) else {}
+    ec = body.get("energyCommunity")
+    detail = me.code or (" · ".join(str(x) for x in (body.get("role"), (ec or {}).get("name"), (ec or {}).get("status")) if x))
+    steps.append({"step": "GET /me", "status": me.status, "ok": me.status == 200, "detail": detail})
+    out["energyCommunity"] = ec
+    out["ok"] = me.status == 200 and body.get("role") == "ENERGY_COMMUNITY"
+    return out

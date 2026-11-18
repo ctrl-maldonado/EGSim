@@ -111,31 +111,21 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
           [_err(401, "UNAUTHORIZED")])
     c.run("AUTH-03", "Ungültiges Bearer-Token → 401", lambda: anon.with_auth(token="egsim.invalid." + rnd).me(),
           [_err(401, "UNAUTHORIZED")])
-    c.run("NF-01", "Markt ohne Eintrag → 404 MARKET_NOT_FOUND",
-          lambda: (sim.admin or (sp_a.eg.client if sp_a else anon)).get_market("2099-12-31"),
-          [_err(404, "MARKET_NOT_FOUND")])
-
-    if sim.admin:
-        adm = sim.admin
-        c.run("NF-02", "Unbekannte EG → 404 ENERGY_COMMUNITY_NOT_FOUND", lambda: adm.get_community(rnd),
-              [_err(404, "ENERGY_COMMUNITY_NOT_FOUND")])
-        c.run("NF-03", "Ungültige EG-ID → 400 INVALID_ID", lambda: adm.get_community("not-a-uuid"), [_err(400, "INVALID_ID")])
-        c.run("STATE-01", "Tagesergebnis vor Settlement → 409 MARKET_NOT_SETTLED", lambda: adm.market_result(d),
-              [_err(409, "MARKET_NOT_SETTLED")])
-        c.run("STATE-02", "Zuteilungen vor Settlement → 409 MARKET_NOT_SETTLED", lambda: adm.allocations(d),
-              [_err(409, "MARKET_NOT_SETTLED")])
-        c.run("STATE-03", "Trades vor Settlement → 409 MARKET_NOT_SETTLED", lambda: adm.trades(d),
-              [_err(409, "MARKET_NOT_SETTLED")])
-        if sp_a:
-            body = sp_a.planned.body(d)
-            c.run("ROLE-01", "Admin reicht Position ein → 403", lambda: adm.submit_position(body), [_err(403, "FORBIDDEN")],
-                  on_unexpected_success=_cleanup(sim, adm))
-    else:
-        c.skip("STATE-01", "Admin-Checks", "kein Admin-Zugang")
-
     if not sp_a:
-        c.skip("POS-*", "Positions-Checks", "keine offene Position vorhanden")
+        c.skip("POS-*", "Positions-Checks", "keine offene eigene Position vorhanden")
         return c.results
+    c.run("NF-01", "Markt ohne Eintrag → 404 MARKET_NOT_FOUND", lambda: sp_a.eg.client.get_market("2099-12-31"),
+          [_err(404, "MARKET_NOT_FOUND")])
+    c.run("NF-02", "Unbekannte EG → 404 ENERGY_COMMUNITY_NOT_FOUND", lambda: sp_a.eg.client.get_community(rnd),
+          [_err(404, "ENERGY_COMMUNITY_NOT_FOUND")])
+    c.run("NF-03", "Ungültige EG-ID → 400 INVALID_ID", lambda: sp_a.eg.client.get_community("not-a-uuid"),
+          [_err(400, "INVALID_ID")])
+    c.run("NF-06", "Ungültiges Datum im Pfad → 400 INVALID_DELIVERY_DATE", lambda: sp_a.eg.client.get_market("20-11-2026"),
+          [_err(400, "INVALID_DELIVERY_DATE")])
+    c.run("STATE-02", "Zuteilungen vor Settlement → 409 MARKET_NOT_SETTLED", lambda: sp_a.eg.client.allocations(d),
+          [_err(409, "MARKET_NOT_SETTLED")])
+    c.run("STATE-03", "Trades vor Settlement → 409 MARKET_NOT_SETTLED", lambda: sp_a.eg.client.trades(d),
+          [_err(409, "MARKET_NOT_SETTLED")])
 
     eg = sp_a.eg
     cl = eg.client
@@ -162,8 +152,10 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
 
     def reattach(r: ApiResponse) -> None:  # falls der Server das fälschlich erlaubt: neuen Key übernehmen
         if isinstance(r.body, dict) and r.body.get("apiKey"):
-            eg.api_key, eg.password = r.body["apiKey"], r.body.get("password")
-            eg.client = cl.with_auth(api_key=eg.api_key)
+            eg.cfg.api_key, eg.cfg.password = r.body["apiKey"], r.body.get("password") or eg.cfg.password
+            eg.client = cl.with_auth(api_key=eg.cfg.api_key)
+            sim.findings.error("check", f"[{eg.key}] EG konnte sich selbst neue Zugangsdaten ausstellen – "
+                                        "neuer API-Key wurde in die Konfiguration übernommen")
     c.run("ROLE-05", "EG vergibt sich selbst Zugangsdaten → 403", lambda: cl.issue_credentials(eg.id),
           [_err(403, "FORBIDDEN")], on_unexpected_success=reattach)
     cl = eg.client
@@ -317,7 +309,7 @@ def run_closed_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
     # neue Position in einem freien Slot, damit 409 eindeutig MARKET_CLOSED sein muss
     taken = {(p.eg.id, p.planned.interval_start) for p in live}
     free_body = None
-    if run.market["resolution"] == "QUARTER_HOUR":
+    if (run.market or {}).get("resolution") == "QUARTER_HOUR":
         for t in quarter_hours(resolve_delivery_date(d)):
             if (sp.eg.id, format_utc(t)) not in taken:
                 free_body = {"deliveryDate": d, "intervalStart": format_utc(t), "type": "DEMAND", "quantityKwh": Decimal(1)}
@@ -347,80 +339,79 @@ def run_closed_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
         c.run("CLOSED-05", "Position nach Settlement ist PROCESSED", lambda: cl.get_position(sp.id), [_err(200)],
               extra=lambda r: None if (r.body or {}).get("status") == "PROCESSED"
               else f"Status {(r.body or {}).get('status')}")
-        if sim.admin:
-            c.run("CLOSED-06", "close erneut aufrufen (idempotent) → 200 SETTLED", lambda: sim.admin.close_market(d),
-                  [_err(200)], extra=lambda r: None if (r.body or {}).get("status") == "SETTLED"
-                  else f"Status {(r.body or {}).get('status')}")
         c.run("CLOSED-07", "EG ruft eigene Zuteilungen ab → 200", lambda: cl.allocations(d), [_err(200)])
     return c.results
 
 
 # =====================================================================================================================
-def run_lifecycle_checks(sim: "Simulator") -> list[dict]:
-    """Registrierung, Statuswechsel, Login/Logout, Zugangsdaten, Löschen – mit einer Wegwerf-EG."""
-    c = Checker(sim, "lifecycle")
-    adm = sim.admin
+def run_account_checks(sim: "Simulator") -> list[dict]:
+    """Login/Logout mit den Zugangsdaten der EGs und optional Registrierungs-Checks."""
+    c = Checker(sim, "konto")
     anon = sim.base
-    email = f"egsim-lifecycle-{sim.run_id}@{sim.cfg.email_domain}"
+    rnd = uuid.uuid4().hex[:8]
+    c.run("AUTH-04", "Login unbekannte E-Mail → 401 INVALID_CREDENTIALS",
+          lambda: anon.login(f"unbekannt-{rnd}@egsim.example", "falsch-123456"), [_err(401, "INVALID_CREDENTIALS")])
+    c.run("AUTH-05", "Login ohne Passwort → 400 VALIDATION_FAILED",
+          lambda: anon.call("POST", "/auth/login", auth=False, json_body={"email": "a@egsim.example"}),
+          [_err(400, "VALIDATION_FAILED")])
 
-    c.run("LC-01", "Registrierung mit ungültiger E-Mail → 400 VALIDATION_FAILED",
+    eg = next((e for e in sim.egs if e.ready and e.cfg.email and e.cfg.password), None)
+    if eg:
+        email, pw = eg.cfg.email, eg.cfg.password
+        c.run("AUTH-06", "Login mit falschem Passwort → 401 INVALID_CREDENTIALS", lambda: anon.login(email, pw + "x"),
+              [_err(401, "INVALID_CREDENTIALS")])
+
+        def login_ok(r: ApiResponse) -> str | None:
+            b = r.body if isinstance(r.body, dict) else {}
+            if b.get("tokenType") != "Bearer" or not b.get("token"):
+                return "token/tokenType fehlen"
+            if b.get("role") != "ENERGY_COMMUNITY" or (b.get("energyCommunity") or {}).get("id") != eg.id:
+                return "role oder energyCommunity falsch"
+            if not isinstance(b.get("expiresIn"), int) or b["expiresIn"] < 1:
+                return "expiresIn fehlt"
+            return None
+        lg = c.run("AUTH-07", "Login → 200 mit Bearer-Token", lambda: anon.login(email, pw), [_err(200)], extra=login_ok)
+        if lg and lg.status == 200 and isinstance(lg.body, dict) and lg.body.get("token"):
+            tk = anon.with_auth(token=lg.body["token"], label=eg.key)
+            c.run("AUTH-08", "GET /me mit Token → 200", tk.me, [_err(200)])
+            c.run("AUTH-09", "Logout → 204", tk.logout, [_err(204)])
+            c.run("AUTH-10", "Token nach Logout → 401", tk.me, [_err(401, "UNAUTHORIZED")])
+    else:
+        c.skip("AUTH-06", "Login-Checks", "keine EG mit E-Mail und Passwort hinterlegt")
+
+    if not sim.cfg.registration_checks:
+        c.skip("REG-*", "Registrierungs-Checks", "abgeschaltet (legen eine PENDING-Test-EG auf der Plattform an)")
+        return c.results
+    email = f"egsim-regtest-{sim.run_id}@egsim.example"
+    c.run("REG-01", "Registrierung mit ungültiger E-Mail → 400 VALIDATION_FAILED",
           lambda: anon.register("keine-email", "EGSim Test"), [_err(400, "VALIDATION_FAILED")])
-    c.run("LC-02", "Registrierung mit Feld status → 400 VALIDATION_FAILED",
+    c.run("REG-02", "Registrierung mit Feld status → 400 VALIDATION_FAILED",
           lambda: anon.call("POST", "/energy-communities", auth=False,
                             json_body={"email": "x-" + email, "name": "EGSim", "status": "ACTIVE"}),
           [_err(400, "VALIDATION_FAILED")])
-    c.run("LC-03", "Registrierung mit leerem Namen → 400 VALIDATION_FAILED",
-          lambda: anon.register("y-" + email, "   "), [_err(400, "VALIDATION_FAILED")])
-    r = c.run("LC-04", "Registrierung → 201 PENDING", lambda: anon.register(email, "EGSim Lifecycle-Test"), [_err(201)],
-              extra=lambda r: None if (r.body or {}).get("status") == "PENDING" else f"Status {(r.body or {}).get('status')}")
-    if not r or r.status != 201:
-        c.skip("LC-*", "weitere Lifecycle-Checks", "Registrierung fehlgeschlagen")
-        return c.results
-    ec_id = r.body["id"]
-    c.run("LC-05", "Gleiche E-Mail erneut → 409 EMAIL_ALREADY_REGISTERED", lambda: anon.register(email, "Doppelt"),
-          [_err(409, "EMAIL_ALREADY_REGISTERED")])
-    c.run("LC-06", "Gleichen Status erneut setzen → 200", lambda: adm.set_status(ec_id, "PENDING"), [_err(200)])
-    c.run("LC-07", "Ungültiger Status → 400 VALIDATION_FAILED", lambda: adm.set_status(ec_id, "DELETED"),
+    c.run("REG-03", "Registrierung mit leerem Namen → 400 VALIDATION_FAILED", lambda: anon.register("y-" + email, "   "),
           [_err(400, "VALIDATION_FAILED")])
-    cred = c.run("LC-08", "Zugangsdaten für PENDING-EG vergeben → 201", lambda: adm.issue_credentials(ec_id), [_err(201)])
-    key = pw = None
-    if cred and cred.status == 201:
-        key, pw = cred.body.get("apiKey"), cred.body.get("password")
-        k = anon.with_auth(api_key=key)
-        c.run("LC-09", "PENDING-EG mit API-Key → 403 ENERGY_COMMUNITY_NOT_ACTIVE", k.me,
-              [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
-        c.run("LC-10", "PENDING-EG Login → 403 ENERGY_COMMUNITY_NOT_ACTIVE", lambda: anon.login(email, pw),
-              [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
-    c.run("LC-11", "PENDING → ACTIVE → 200", lambda: adm.set_status(ec_id, "ACTIVE"), [_err(200)])
-    c.run("LC-12", "ACTIVE → PENDING → 409 INVALID_STATUS_TRANSITION", lambda: adm.set_status(ec_id, "PENDING"),
-          [_err(409, "INVALID_STATUS_TRANSITION")])
-    if key:
-        c.run("LC-13", "Aktive EG mit API-Key → 200 role ENERGY_COMMUNITY", anon.with_auth(api_key=key).me, [_err(200)],
-              extra=lambda r: None if (r.body or {}).get("role") == "ENERGY_COMMUNITY" else "role falsch")
-        c.run("LC-14", "Login mit falschem Passwort → 401 INVALID_CREDENTIALS", lambda: anon.login(email, pw + "x"),
-              [_err(401, "INVALID_CREDENTIALS")])
-        c.run("LC-15", "Login unbekannte E-Mail → 401 INVALID_CREDENTIALS", lambda: anon.login("nobody-" + email, pw),
-              [_err(401, "INVALID_CREDENTIALS")])
-        lg = c.run("LC-16", "Login → 200 Bearer-Token", lambda: anon.login(email, pw), [_err(200)],
-                   extra=lambda r: None if (r.body or {}).get("tokenType") == "Bearer" and (r.body or {}).get("token")
-                   else "token/tokenType fehlen")
-        if lg and lg.status == 200 and (lg.body or {}).get("token"):
-            tk = anon.with_auth(token=lg.body["token"])
-            c.run("LC-17", "GET /me mit Token → 200", tk.me, [_err(200)])
-            c.run("LC-18", "Logout → 204", tk.logout, [_err(204)])
-            c.run("LC-19", "Token nach Logout → 401", tk.me, [_err(401, "UNAUTHORIZED")])
-        c.run("LC-20", "Neue Zugangsdaten vergeben → 201", lambda: adm.issue_credentials(ec_id), [_err(201)])
-        c.run("LC-21", "Alter API-Key nach Neuvergabe → 401", anon.with_auth(api_key=key).me, [_err(401, "UNAUTHORIZED")])
-    c.run("LC-22", "ACTIVE → SUSPENDED → 200", lambda: adm.set_status(ec_id, "SUSPENDED"), [_err(200)])
-    c.run("LC-23", "SUSPENDED → ACTIVE → 200", lambda: adm.set_status(ec_id, "ACTIVE"), [_err(200)])
-    c.run("LC-24", "EG-Liste mit Statusfilter (Admin) → 200",
-          lambda: adm.list_communities("ACTIVE"), [_err(200)],
-          extra=lambda r: None if all(x.get("status") == "ACTIVE" for x in (r.body or [])) else "Filter wirkt nicht")
-    c.run("LC-25", "EG ohne Positionen löschen → 204", lambda: adm.delete_community(ec_id), [_err(204)])
-    c.run("LC-26", "Gelöschte EG abrufen → 404", lambda: adm.get_community(ec_id), [_err(404, "ENERGY_COMMUNITY_NOT_FOUND")])
+    c.run("REG-04", "Name mit 121 Zeichen → 400 VALIDATION_FAILED", lambda: anon.register("z-" + email, "N" * 121),
+          [_err(400, "VALIDATION_FAILED")])
 
-    used = next((e for e in sim.egs if e.ready and any(sp.id and sp.eg is e for m in sim.markets for sp in m.positions)), None)
-    if used:
-        c.run("LC-27", "EG mit Positionen löschen → 409 ENERGY_COMMUNITY_IN_USE", lambda: adm.delete_community(used.id),
-              [_err(409, "ENERGY_COMMUNITY_IN_USE")])
+    def pending(r: ApiResponse) -> str | None:
+        b = r.body if isinstance(r.body, dict) else {}
+        if b.get("status") != "PENDING":
+            return f"Status {b.get('status')} statt PENDING"
+        if not b.get("id") or "apiKey" in b or "password" in b:
+            return "id fehlt oder Antwort enthält Zugangsdaten"
+        return None
+    r = c.run("REG-05", "Registrierung → 201 PENDING", lambda: anon.register(email, f"EGSim Registrierungstest {rnd}",
+                                                                           "Von EGSim angelegt, kann gelöscht werden"),
+              [_err(201)], extra=pending)
+    if r and r.status == 201:
+        c.run("REG-06", "Gleiche E-Mail erneut → 409 EMAIL_ALREADY_REGISTERED", lambda: anon.register(email, "Doppelt"),
+              [_err(409, "EMAIL_ALREADY_REGISTERED")])
+        c.run("REG-07", "Gleiche E-Mail in Großbuchstaben → 409 EMAIL_ALREADY_REGISTERED",
+              lambda: anon.register(email.upper(), "Doppelt"), [_err(409, "EMAIL_ALREADY_REGISTERED")],
+              note_on={(201, None): "E-Mail-Vergleich ist case-sensitiv"})
+        c.run("REG-08", "Login einer PENDING-EG ohne Passwort-Vergabe → 401/403",
+              lambda: anon.login(email, "egal-12345678"),
+              [_err(401, "INVALID_CREDENTIALS"), _err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
+        sim.findings.info("check", f"Registrierungstest hat die PENDING-EG {email} angelegt – Admin kann sie löschen")
     return c.results

@@ -7,3 +7,5 @@ reports/
 config.yaml
 .egsim-state.json
 *.state.json
+egsim-ui.json
+egsim-mock.json

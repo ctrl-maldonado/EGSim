@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -59,8 +59,10 @@ class ApiResponse:
 class RequestStats:
     """Thread-sichere Statistik je Endpoint (Template) und Statuscode."""
 
-    def __init__(self) -> None:
+    def __init__(self, log_size: int = 2000) -> None:
         self._lock = threading.Lock()
+        self.log: deque[dict] = deque(maxlen=log_size)  # einzelne Requests für die UI
+        self._seq = 0
         self.counts: dict[tuple[str, str], dict[int, int]] = defaultdict(lambda: defaultdict(int))
         self.latencies: dict[tuple[str, str], list[float]] = defaultdict(list)
         self.transport_errors = 0
@@ -71,6 +73,16 @@ class RequestStats:
             self.latencies[(method, template)].append(ms)
             if status == 0:
                 self.transport_errors += 1
+
+    def record_detail(self, entry: dict) -> None:
+        with self._lock:
+            self._seq += 1
+            entry["seq"] = self._seq
+            self.log.append(entry)
+
+    def log_since(self, seq: int) -> list[dict]:
+        with self._lock:
+            return [e for e in self.log if e["seq"] > seq]
 
     def summary(self) -> list[dict]:
         out = []
@@ -159,6 +171,7 @@ class ApiClient:
         except requests.RequestException as exc:
             ms = (time.perf_counter() - t0) * 1000
             self.stats.record(method, template, 0, ms)
+            self._detail(method, path, clean_params, json_body, raw_body, 0, None, ms, str(exc))
             log.warning("[%s] %s %s -> Transportfehler: %s", self.label, method, path, exc)
             return ApiResponse(method, path, 0, None, ms, error=type(exc).__name__ + ": " + str(exc))
         ms = (time.perf_counter() - t0) * 1000
@@ -169,8 +182,25 @@ class ApiClient:
             except ValueError:
                 body = r.text
         self.stats.record(method, template, r.status_code, ms)
+        self._detail(method, path, clean_params, json_body, raw_body, r.status_code, body, ms, None)
         log.debug("[%s] %s %s -> %s (%.0f ms)", self.label, method, path, r.status_code, ms)
         return ApiResponse(method, path, r.status_code, body, ms)
+
+    def _detail(self, method, path, params, json_body, raw_body, status, body, ms, error) -> None:
+        req = _to_jsonable(json_body) if json_body is not None else raw_body
+        if isinstance(req, dict) and "password" in req:
+            req = {**req, "password": "***"}
+        resp = _to_jsonable(body) if not isinstance(body, str) else body
+        if isinstance(resp, dict):  # Secrets nie im Log
+            resp = {k: ("***" if k in ("apiKey", "password", "token") else v) for k, v in resp.items()}
+        text = json.dumps(resp, ensure_ascii=False) if resp is not None else ""
+        if len(text) > 6000:
+            resp = text[:6000] + " …(gekürzt)"
+        self.stats.record_detail({
+            "time": time.strftime("%H:%M:%S"), "actor": self.label, "method": method, "path": path,
+            "query": params or None, "status": status, "ms": round(ms, 1), "request": req, "response": resp,
+            "error": error,
+        })
 
     # -------------------------------------------------------------- endpoints
     def health_ready(self) -> ApiResponse:

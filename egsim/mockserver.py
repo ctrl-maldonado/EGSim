@@ -67,6 +67,9 @@ STATUS_OF = {"VALIDATION_FAILED": 400, "INVALID_ID": 400, "INVALID_DELIVERY_DATE
              "MARKET_NOT_SETTLED": 409, "DELIVERY_DATE_IN_PAST": 422, "INTERNAL_ERROR": 500}
 
 
+DEMO_NAMES = ["EG Sonnenfeld", "EG Windpark Nord", "EG Altstadt", "Gewerbepark Süd", "EG Dorfmitte"]
+
+
 class ApiErr(Exception):
     def __init__(self, code: str, details: list[dict] | None = None, message: str | None = None):
         self.code, self.details = code, details
@@ -252,6 +255,9 @@ class MockPlatform:
         ("GET", r"/markets/([^/]+)/allocations", "allocations"),
         ("GET", r"/markets/([^/]+)/trades", "trades"),
         ("POST", r"/_mock/markets", "mock_market"),
+        ("GET", r"/_mock/markets", "mock_markets"),
+        ("POST", r"/_mock/markets/([^/]+)/close", "mock_close"),
+        ("POST", r"/_mock/energy-communities/([^/]+)/approve", "mock_approve"),
     ]
 
     def handle(self, method: str, path: str, query: dict[str, str], headers: dict[str, str], raw: bytes) -> tuple[int, Any]:
@@ -576,23 +582,60 @@ class MockPlatform:
         role, _, _ = self._auth(h)
         self._need(role, "ADMIN")
         m = self._market(self._check_date(raw_d))
-        if m["status"] in ("OPEN", "FAILED"):
-            if m["status"] == "OPEN":
-                ts = _ts()
-                for p in self.positions.values():
-                    if p["deliveryDate"] == m["deliveryDate"] and p["status"] == "OPEN":
-                        owner = self.ecs.get(p["energyCommunityId"])
-                        if owner and owner["status"] == "ACTIVE":
-                            p["status"] = "CLOSED"
-                        else:
-                            p["status"], p["rejectionReason"] = "REJECTED", "ENERGY_COMMUNITY_NOT_ACTIVE"
-                        p["updatedAt"] = ts
-            m["status"], m["closedAt"], m["failureReason"] = "CLOSED", _ts(), None
-            if self.settlement_delay > 0:
-                threading.Timer(self.settlement_delay, self._settle_locked, args=(m["deliveryDate"],)).start()
-            else:
-                self._settle(m["deliveryDate"])
-        return (200 if m["status"] == "SETTLED" else 202), m
+        return self.close_market(m["deliveryDate"])
+
+    def close_market(self, d: str) -> tuple[int, dict]:
+        """Wie POST /markets/{d}/close durch den Admin (auch für Tests und die Mock-Steuerung)."""
+        with self.lock:
+            m = self._market(d)
+            if m["status"] in ("OPEN", "FAILED"):
+                if m["status"] == "OPEN":
+                    ts = _ts()
+                    for p in self.positions.values():
+                        if p["deliveryDate"] == d and p["status"] == "OPEN":
+                            owner = self.ecs.get(p["energyCommunityId"])
+                            if owner and owner["status"] == "ACTIVE":
+                                p["status"] = "CLOSED"
+                            else:
+                                p["status"], p["rejectionReason"] = "REJECTED", "ENERGY_COMMUNITY_NOT_ACTIVE"
+                            p["updatedAt"] = ts
+                m["status"], m["closedAt"], m["failureReason"] = "CLOSED", _ts(), None
+                if self.settlement_delay > 0:
+                    threading.Timer(self.settlement_delay, self._settle_locked, args=(d,)).start()
+                else:
+                    self._settle(d)
+            return (200 if m["status"] == "SETTLED" else 202), m
+
+    def add_demo_community(self, name: str, email: str | None = None) -> dict:
+        """Aktive EG mit Zugangsdaten anlegen (übernimmt im Mock die Rolle des Admins)."""
+        with self.lock:
+            ts = _ts()
+            ec = {"id": str(uuid.uuid4()), "email": email or f"{re.sub('[^a-z0-9]+', '-', name.lower()).strip('-')}"
+                  f"@demo.egsim.example", "name": name, "description": "Demo-EG im Mock", "status": "ACTIVE",
+                  "createdAt": ts, "updatedAt": ts}
+            self.ecs[ec["id"]] = ec
+            api_key, pw = "egk_" + secrets.token_urlsafe(24), secrets.token_urlsafe(12)
+            self.secrets[ec["id"]] = {"apiKey": _hash(api_key), "password": _hash(pw)}
+            return {**ec, "apiKey": api_key, "password": pw}
+
+    def approve(self, ec_id: str) -> dict:
+        """Mock-Admin: EG freischalten und Zugangsdaten vergeben."""
+        with self.lock:
+            ec = self.ecs.get(ec_id)
+            if not ec:
+                raise ApiErr("ENERGY_COMMUNITY_NOT_FOUND")
+            ec["status"], ec["updatedAt"] = "ACTIVE", _ts()
+            api_key, pw = "egk_" + secrets.token_urlsafe(24), secrets.token_urlsafe(12)
+            self.secrets[ec_id] = {"apiKey": _hash(api_key), "password": _hash(pw)}
+            return {"apiKey": api_key, "password": pw}
+
+    def auto_settle_loop(self, stop: threading.Event, interval: float = 2.0) -> None:
+        """Betreiber spielen: Märkte nach closesAt automatisch schließen und abwickeln."""
+        while not stop.wait(interval):
+            for d, m in list(self.markets.items()):
+                if m["status"] == "OPEN" and now_utc() >= parse_ts(m["closesAt"]):
+                    log.info("Mock: schließe Markt %s (closesAt erreicht)", d)
+                    self.close_market(d)
 
     def _settle_locked(self, d: str) -> None:
         with self.lock:
@@ -672,6 +715,15 @@ class MockPlatform:
                      and ("direction" not in q or t["direction"] == q["direction"])
                      and (pid is None or t["positionId"] == pid)]
 
+    def h_mock_markets(self, q, h, raw):
+        return 200, list(self.markets.values())
+
+    def h_mock_close(self, raw_d, q, h, raw):
+        return self.close_market(self._check_date(raw_d))
+
+    def h_mock_approve(self, raw_id, q, h, raw):
+        return 200, self.approve(_check_uuid(raw_id))
+
     def h_mock_market(self, q, h, raw):
         b = self._body(raw)
         d = resolve_delivery_date(b.get("deliveryDate", "tomorrow")).isoformat()
@@ -734,6 +786,12 @@ def serve(args) -> None:
         ms = parse_market_spec(spec)
         platform.add_market(ms["d"], ms["resolution"], ms["buy"], ms["sell"], ms["reserve"], closes)
         print(f"Markt {ms['d']} ({ms['resolution']}) Preise {ms['buy']}/{ms['sell']}/{ms['reserve']}, closesAt {format_utc(closes)}")
+    for i in range(getattr(args, "demo_egs", 0) or 0):
+        eg = platform.add_demo_community(DEMO_NAMES[i % len(DEMO_NAMES)] + ("" if i < len(DEMO_NAMES) else f" {i}"))
+        print(f"Demo-EG {eg['name']}: id={eg['id']} email={eg['email']} apiKey={eg['apiKey']} password={eg['password']}")
+    if getattr(args, "auto_settle", False):
+        threading.Thread(target=platform.auto_settle_loop, args=(threading.Event(),), daemon=True).start()
+        print("Märkte werden nach closesAt automatisch geschlossen und abgewickelt")
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(platform))
     print(f"EGSim-Mock läuft auf http://{args.host}:{args.port} (Admin-API-Key: {args.admin_api_key}) – Strg+C beendet")
     try:

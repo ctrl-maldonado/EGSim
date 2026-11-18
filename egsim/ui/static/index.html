@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EGSim – Energiegemeinschaften simulieren</title>
+<style>
+  :root {
+    --bg: #f5f6f3; --panel: #fff; --ink: #1d2320; --muted: #66706a; --line: #dfe3dc;
+    --accent: #2f7d4f; --accent-soft: #e4f1e8; --warn: #a86b00; --warn-soft: #fbf0d9;
+    --err: #b3261e; --err-soft: #fbe5e3; --info: #2d5f9a; --info-soft: #e3ecf7;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: var(--bg); }
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  header h1 span { color: var(--accent); }
+  nav { display: flex; gap: 2px; }
+  nav button { background: none; border: 0; padding: 8px 12px; border-radius: 6px; cursor: pointer; color: var(--muted); font: inherit; }
+  nav button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .spacer { flex: 1; }
+  #saveState { font-size: 12px; color: var(--muted); }
+  main { max-width: 1240px; margin: 0 auto; padding: 18px 20px 60px; }
+  section.tab { display: none; } section.tab.active { display: block; }
+  .grid { display: grid; gap: 16px; }
+  .cols-2 { grid-template-columns: 1fr 1fr; } .cols-3 { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 900px) { .cols-2, .cols-3 { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+  .panel h3 { font-size: 14px; margin: 14px 0 8px; }
+  label.f { display: grid; grid-template-columns: 190px 1fr; align-items: center; gap: 10px; margin: 7px 0; }
+  label.f > span { color: var(--muted); }
+  label.f small, .hint { color: var(--muted); font-size: 12px; }
+  input, select, textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); width: 100%; }
+  input[type=checkbox] { width: auto; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  textarea { font-family: var(--mono); font-size: 12px; min-height: 120px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row > input { flex: 1; min-width: 70px; }
+  button.b { font: inherit; padding: 7px 14px; border-radius: 7px; border: 1px solid var(--line); background: #fff; cursor: pointer; }
+  button.b:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.08); }
+  button.danger { color: var(--err); }
+  button:disabled { opacity: .5; cursor: default; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; font-weight: 600; background: #eef0ec; color: var(--muted); }
+  .chip.ok { background: var(--accent-soft); color: var(--accent); } .chip.err { background: var(--err-soft); color: var(--err); }
+  .chip.warn { background: var(--warn-soft); color: var(--warn); } .chip.info { background: var(--info-soft); color: var(--info); }
+  .banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; }
+  .banner.err { background: var(--err-soft); color: var(--err); } .banner.info { background: var(--info-soft); color: var(--info); }
+  .banner.warn { background: var(--warn-soft); color: var(--warn); }
+  .eg { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 14px; }
+  .eg.off { opacity: .6; }
+  .eg-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .eg-head input.name { font-weight: 600; font-size: 15px; border-color: transparent; max-width: 320px; }
+  .eg-head input.name:hover { border-color: var(--line); }
+  .eg-body { display: grid; grid-template-columns: 1.1fr 1fr 220px; gap: 18px; padding: 12px 16px 16px; }
+  @media (max-width: 1100px) { .eg-body { grid-template-columns: 1fr; } }
+  .eg-body label.f { grid-template-columns: 130px 1fr; }
+  .eg-result { font-size: 12px; margin-top: 8px; }
+  .eg-result div { padding: 2px 0; }
+  .mini { width: 100%; height: 90px; display: block; }
+  .legend { font-size: 12px; color: var(--muted); display: flex; gap: 12px; }
+  .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  .cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 16px; }
+  @media (max-width: 900px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card b { display: block; font-size: 24px; font-variant-numeric: tabular-nums; }
+  .card span { color: var(--muted); font-size: 12px; }
+  .card.err b { color: var(--err); } .card.ok b { color: var(--accent); } .card.warn b { color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+  td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+  tr.click { cursor: pointer; } tr.click:hover td { background: #f7f9f6; }
+  tr.sel td { background: var(--accent-soft); }
+  .scroll { max-height: 520px; overflow: auto; }
+  #log { font-family: var(--mono); font-size: 12px; background: #1d2320; color: #dfe7e1; border-radius: 8px; padding: 10px 12px; height: 340px; overflow: auto; white-space: pre-wrap; }
+  #log .WARNING { color: #f2c46d; } #log .ERROR { color: #ff8a80; }
+  pre.json { font-family: var(--mono); font-size: 12px; background: #f7f8f6; border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; max-height: 420px; margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; }
+  .status-2 { color: var(--accent); font-weight: 600; } .status-4 { color: var(--warn); font-weight: 600; } .status-5, .status-0 { color: var(--err); font-weight: 600; }
+  .muted { color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 160px 1fr; gap: 4px 12px; font-size: 13px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .toolbar input[type=search] { max-width: 260px; }
+  details summary { cursor: pointer; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>EG</span>Sim</h1>
+  <nav id="nav">
+    <button data-tab="run" class="active">Lauf</button>
+    <button data-tab="egs">Energiegemeinschaften</button>
+    <button data-tab="manual">Manuell</button>
+    <button data-tab="result">Ergebnis</button>
+    <button data-tab="requests">Requests</button>
+  </nav>
+  <div class="spacer"></div>
+  <span id="runChip" class="chip">bereit</span>
+  <span id="saveState"></span>
+</header>
+
+<main>
+  <div id="configError" class="banner err" hidden></div>
+  <div id="mockBanner" class="banner info" hidden></div>
+
+  <!-- ======================================================= LAUF -->
+  <section class="tab active" id="tab-run">
+    <div class="grid cols-2">
+      <div class="panel">
+        <h2>Plattform</h2>
+        <label class="f"><span>Basis-URL</span><input data-path="platform.baseUrl" placeholder="http://localhost:8080"></label>
+        <label class="f"><span>Timeout (s)</span><input type="number" min="1" data-path="platform.timeoutSeconds" data-type="num"></label>
+        <label class="f"><span>TLS-Zertifikat prüfen</span><input type="checkbox" data-path="platform.verifyTls" data-type="bool"></label>
+
+        <h2 style="margin-top:20px">Markt &amp; Ablauf</h2>
+        <label class="f"><span>Liefertage</span><div><input data-path="run.deliveryDates" data-type="list" placeholder="tomorrow, +2, 2026-11-20"><small>today, tomorrow, +N oder JJJJ-MM-TT, mit Komma getrennt. Der Markt muss existieren.</small></div></label>
+        <label class="f"><span>Positionen einreichen</span><input type="checkbox" data-path="run.submitPositions" data-type="bool"></label>
+        <label class="f"><span>Bestehende Position</span><select data-path="run.onExistingPosition"><option value="skip">überspringen</option><option value="update">mit neuen Werten aktualisieren</option></select></label>
+        <label class="f"><span>Auf Settlement warten</span><div class="row"><input type="number" min="0" step="1" data-path="run.waitForSettlementMinutes" data-type="num"><span class="muted">Minuten</span></div></label>
+        <p class="hint">Der Simulator schließt keine Märkte. Mit Wartezeit fragt er den Marktstatus alle 10 s ab, bis euer Betreiber den Markt geschlossen und abgewickelt hat, und prüft dann die Ergebnisse.</p>
+      </div>
+
+      <div class="panel">
+        <h2>Verhalten</h2>
+        <label class="f"><span>Seed</span><div><input type="number" data-path="run.seed" data-type="int"><small>gleicher Seed = gleiche Mengen und Preise; leer = zufällig</small></div></label>
+        <label class="f"><span>Parallele Requests</span><input type="number" min="1" max="64" data-path="run.concurrency" data-type="int"></label>
+        <label class="f"><span>Pause vor Einreichen</span><div class="row"><input type="number" min="0" data-path="run.delayMs.0" data-type="int"><span class="muted">bis</span><input type="number" min="0" data-path="run.delayMs.1" data-type="int"><span class="muted">ms</span></div></label>
+        <label class="f"><span>Positionen ändern</span><div class="row"><input type="number" min="0" max="100" data-path="behaviour.updateProbability" data-type="pct"><span class="muted">% um bis zu ±</span><input type="number" min="0" max="100" data-path="behaviour.updateChangePercent" data-type="num"><span class="muted">%</span></div></label>
+        <label class="f"><span>Positionen stornieren</span><div class="row"><input type="number" min="0" max="100" data-path="behaviour.cancelProbability" data-type="pct"><span class="muted">%</span></div></label>
+        <label class="f"><span>15-Min-Intervalle</span><div class="row"><select id="qhMode"><option value="all">alle (96)</option><option value="daylight">tagsüber 6–20 Uhr</option><option value="n">Anzahl zufällig</option></select><input id="qhN" type="number" min="1" max="100" style="max-width:90px"></div></label>
+
+        <h2 style="margin-top:20px">Prüfungen</h2>
+        <label class="f"><span>Negativtests</span><div><input type="checkbox" data-path="run.checks" data-type="bool"> <small>Fehlercodes, Rollen, Mandantentrennung, Validierung</small></div></label>
+        <label class="f"><span>Registrierungstests</span><div><input type="checkbox" data-path="run.registrationChecks" data-type="bool"> <small>legt eine PENDING-Test-EG auf der Plattform an</small></div></label>
+        <label class="f"><span>Ergebnisse prüfen</span><input type="checkbox" data-path="run.verifyResults" data-type="bool"></label>
+        <label class="f"><span>Nur simulierte EGs am Markt</span><div><input type="checkbox" data-path="run.allParticipantsSimulated" data-type="bool"> <small>dann rechnet EGSim das Matching komplett nach</small></div></label>
+        <label class="f"><span>Toleranz</span><div class="row"><input type="number" min="0" step="0.001" data-path="run.tolerance.kwh" data-type="num"><span class="muted">kWh</span><input type="number" min="0" step="0.01" data-path="run.tolerance.eur" data-type="num"><span class="muted">EUR</span></div></label>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <div class="toolbar">
+        <button class="b primary" id="btnRun">Lauf starten</button>
+        <button class="b" id="btnVerify" title="Nur anmelden, Märkte abrufen und abgewickelte Ergebnisse prüfen">Nur Ergebnisse prüfen</button>
+        <button class="b danger" id="btnStop" disabled>Abbrechen</button>
+        <span class="spacer"></span>
+        <span id="liveInfo" class="muted"></span>
+      </div>
+      <div id="log"></div>
+    </div>
+  </section>
+
+  <!-- ======================================================= EGs -->
+  <section class="tab" id="tab-egs">
+    <div class="banner info">
+      Der Simulator hat keinen Admin-Zugang. Ablauf für eine neue EG: E-Mail eintragen → <b>Registrieren</b> (Status PENDING) →
+      der Admin eurer Plattform schaltet sie frei und übergibt API-Key und Passwort → hier eintragen → <b>Verbindung testen</b>.
+      Für die Tests zur Mandantentrennung braucht es mindestens zwei aktive EGs.
+    </div>
+    <div class="toolbar">
+      <button class="b primary" id="btnAddEg">+ EG hinzufügen</button>
+      <button class="b" id="btnTestAll">Alle Verbindungen testen</button>
+      <span class="spacer"></span>
+      <button class="b" id="btnPlan">Vorschau der Positionen</button>
+      <select id="planRes" style="width:auto"><option value="DAY">Tagesmarkt</option><option value="QUARTER_HOUR">15-Minuten-Markt</option></select>
+    </div>
+    <div id="egList"></div>
+    <div id="planOut" class="panel" hidden></div>
+  </section>
+
+  <!-- ======================================================= MANUELL -->
+  <section class="tab" id="tab-manual">
+    <div class="grid cols-2">
+      <div class="panel">
+        <h2>Request als EG senden</h2>
+        <label class="f"><span>EG</span><select id="mEg"></select></label>
+        <label class="f"><span>Aktion</span><select id="mAction">
+          <option value="me">GET /me – eigene Rolle und EG</option>
+          <option value="market">GET /markets/{deliveryDate}</option>
+          <option value="submitPosition">POST /positions – Angebot/Bedarf</option>
+          <option value="listPositions">GET /positions</option>
+          <option value="getPosition">GET /positions/{id}</option>
+          <option value="updatePosition">PUT /positions/{id}</option>
+          <option value="cancelPosition">DELETE /positions/{id}</option>
+          <option value="allocations">GET /markets/{deliveryDate}/allocations</option>
+          <option value="trades">GET /markets/{deliveryDate}/trades</option>
+          <option value="getCommunity">GET /energy-communities/{id} (eigene)</option>
+          <option value="updateCommunity">PUT /energy-communities/{id} (Profil)</option>
+          <option value="raw">Freier Request …</option>
+        </select></label>
+        <div id="mFields"></div>
+        <div class="toolbar" style="margin-top:12px"><button class="b primary" id="mSend">Senden</button><span id="mInfo" class="muted"></span></div>
+      </div>
+      <div class="panel">
+        <h2>Antwort</h2>
+        <div id="mResult" class="muted">Noch kein Request gesendet.</div>
+      </div>
+    </div>
+    <div class="panel" id="mockPanel" style="margin-top:16px" hidden>
+      <h2>Mock-Steuerung (nur im Demo-Modus)</h2>
+      <p class="hint">Spielt den Betreiber: Märkte anlegen und schließen, Reserve begrenzen. Gibt es bei eurer echten Plattform nicht.</p>
+      <div class="toolbar">
+        <input id="mkDate" placeholder="Liefertag, z. B. +3" style="max-width:160px">
+        <select id="mkRes" style="width:auto"><option>DAY</option><option>QUARTER_HOUR</option></select>
+        <input id="mkMin" type="number" value="10" style="max-width:90px" title="Minuten bis closesAt"><span class="muted">min bis closesAt</span>
+        <button class="b" id="mkAdd">Markt anlegen</button>
+        <span class="spacer"></span>
+        <span class="muted">Reserve je Intervall</span><input id="mkCap" placeholder="unbegrenzt" style="max-width:110px"><span class="muted">kWh</span>
+        <button class="b" id="mkCapSet">setzen</button>
+      </div>
+      <table><thead><tr><th>Liefertag</th><th>Auflösung</th><th>Status</th><th>closesAt</th><th>Preise (Ankauf/Verkauf/Reserve)</th><th></th></tr></thead><tbody id="mkList"></tbody></table>
+    </div>
+  </section>
+
+  <!-- ======================================================= ERGEBNIS -->
+  <section class="tab" id="tab-result">
+    <div class="toolbar">
+      <select id="repSelect" style="max-width:420px"><option value="">Letzter Lauf</option></select>
+      <a id="repDownload" class="b" style="text-decoration:none;color:inherit;padding:7px 14px;border:1px solid var(--line);border-radius:7px;background:#fff" download hidden>JSON herunterladen</a>
+    </div>
+    <div id="resultOut" class="muted">Noch kein Lauf.</div>
+  </section>
+
+  <!-- ======================================================= REQUESTS -->
+  <section class="tab" id="tab-requests">
+    <div class="toolbar">
+      <select id="rqSource" style="width:auto"><option value="run">Letzter Lauf</option><option value="manual">Manuell &amp; Verbindungstests</option></select>
+      <input type="search" id="rqFilter" placeholder="Filter (Pfad, EG, Code …)">
+      <label><input type="checkbox" id="rqErrors"> nur ≥ 400</label>
+      <span class="spacer"></span><span id="rqCount" class="muted"></span>
+    </div>
+    <div class="grid cols-2">
+      <div class="panel scroll" style="padding:0"><table><thead><tr><th>Zeit</th><th>EG</th><th>Request</th><th>Status</th><th>ms</th></tr></thead><tbody id="rqList"></tbody></table></div>
+      <div class="panel" id="rqDetail"><span class="muted">Request anklicken für Details.</span></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtJson = v => esc(typeof v === "string" ? v : JSON.stringify(v, null, 2));
+const S = { config: null, profiles: [], mock: false, run: null, logSince: 0, reqSince: 0, runRequests: [], manualRequests: [], manualSince: 0, report: null, selReq: null };
+
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: body !== undefined ? {"Content-Type": "application/json"} : {}, body: body !== undefined ? JSON.stringify(body) : undefined });
+  let data = null; try { data = await r.json(); } catch (_) {}
+  if (!r.ok) throw new Error((data && data.error) || r.statusText);
+  return data;
+}
+
+// ------------------------------------------------------------------ Tabs
+$$("#nav button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
+function showTab(t) {
+  $$("#nav button").forEach(x => x.classList.toggle("active", x.dataset.tab === t));
+  $$("section.tab").forEach(x => x.classList.toggle("active", x.id === "tab-" + t));
+  if (t === "requests") { if ($("#rqSource").value === "manual") loadManualLog(); renderRequests(); }
+  if (t === "result") loadReportList();
+  if (t === "manual") { renderManualEgs(); if (S.mock) loadMockMarkets(); }
+}
+
+// --------------------------------------------------------- Pfad-Helfer
+function getPath(obj, path) { return path.split(".").reduce((o, k) => o == null ? undefined : o[k], obj); }
+function setPath(obj, path, val) {
+  const keys = path.split("."); let o = obj;
+  keys.slice(0, -1).forEach((k, i) => { if (o[k] == null || typeof o[k] !== "object") o[k] = /^\d+$/.test(keys[i + 1]) ? [] : {}; o = o[k]; });
+  o[keys[keys.length - 1]] = val;
+}
+function readInput(el) {
+  const t = el.dataset.type;
+  if (t === "bool") return el.checked;
+  if (t === "num") return el.value === "" ? 0 : Number(el.value);
+  if (t === "int") return el.value === "" ? null : parseInt(el.value, 10);
+  if (t === "pct") return el.value === "" ? 0 : Number(el.value) / 100;
+  if (t === "list") return el.value.split(",").map(s => s.trim()).filter(Boolean);
+  if (t === "range0" || t === "range1") return el.value === "" ? 0 : Number(el.value);
+  return el.value;
+}
+function writeInput(el, v) {
+  const t = el.dataset.type;
+  if (t === "bool") el.checked = !!v;
+  else if (t === "pct") el.value = v == null ? "" : +(v * 100).toFixed(2);
+  else if (t === "list") el.value = (v || []).join(", ");
+  else el.value = v ?? "";
+}
+
+// --------------------------------------------------------------- Speichern
+let saveTimer = null;
+function scheduleSave() {
+  $("#saveState").textContent = "ungespeichert …";
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 400);
+}
+async function saveNow() {
+  clearTimeout(saveTimer);
+  try {
+    const r = await api("PUT", "/api/config", S.config);
+    $("#saveState").textContent = "gespeichert";
+    showConfigError(r.configError);
+  } catch (e) { $("#saveState").textContent = "Fehler beim Speichern: " + e.message; }
+}
+function showConfigError(msg) {
+  const el = $("#configError");
+  el.hidden = !msg; el.textContent = msg ? "Konfiguration unvollständig: " + msg : "";
+  $("#btnRun").disabled = $("#btnVerify").disabled = !!msg || (S.run && S.run.status === "running");
+}
+
+// ------------------------------------------------------------ Lauf-Formular
+function bindRunForm() {
+  $$("#tab-run [data-path]").forEach(el => {
+    writeInput(el, getPath(S.config, el.dataset.path));
+    el.oninput = el.onchange = () => { setPath(S.config, el.dataset.path, readInput(el)); scheduleSave(); };
+  });
+  const qh = getPath(S.config, "behaviour.quarterHour.intervals") ?? "all";
+  $("#qhMode").value = typeof qh === "number" ? "n" : qh;
+  $("#qhN").value = typeof qh === "number" ? qh : 12;
+  $("#qhN").hidden = $("#qhMode").value !== "n";
+  const upd = () => {
+    $("#qhN").hidden = $("#qhMode").value !== "n";
+    setPath(S.config, "behaviour.quarterHour.intervals", $("#qhMode").value === "n" ? Math.max(1, parseInt($("#qhN").value || "12", 10)) : $("#qhMode").value);
+    scheduleSave();
+  };
+  $("#qhMode").onchange = upd; $("#qhN").oninput = upd;
+}
+
+// --------------------------------------------------------------- Profile
+function shape(p, h) {
+  if (p === "solar") return (h >= 6.5 && h <= 17.5) ? Math.max(0, Math.sin(Math.PI * (h - 6.5) / 11)) : 0;
+  if (p === "wind") return 1 + 0.25 * Math.cos(2 * Math.PI * (h - 3) / 24);
+  if (p === "household") return 0.35 + 0.5 * Math.exp(-(((h - 7.5) / 1.2) ** 2)) + 0.9 * Math.exp(-(((h - 19) / 1.8) ** 2));
+  if (p === "business") return (h >= 8 && h < 18) ? 1.2 : 0.2;
+  if (p === "night") return (h >= 22 || h < 6) ? 1 : 0.2;
+  return 1;
+}
+const PROFILE_LABEL = { solar: "Solar", wind: "Wind", flat: "konstant", household: "Haushalte", business: "Gewerbe 8–18 Uhr", night: "Nacht (Wärmepumpe, E-Auto)" };
+function profileSvg(c) {
+  const W = 220, H = 90, P = 6, PB = 14;
+  const series = [];
+  const avg = r => r ? (Number(r[0]) + Number(r[1])) / 2 : 0;
+  const mk = (flow, color) => {
+    if (!flow || !flow.profile) return;
+    const hours = [...Array(96).keys()].map(i => i / 4);
+    const sum = hours.reduce((s, h) => s + shape(flow.profile, h), 0) || 1;
+    const vals = hours.map(h => shape(flow.profile, h) / sum * avg(flow.dailyKwh));
+    series.push({ vals, color });
+  };
+  mk(c.generation, "#2f7d4f"); mk(c.consumption, "#c26a1b");
+  const max = Math.max(0.0001, ...series.flatMap(s => s.vals));
+  const paths = series.map(s => `<path d="${s.vals.map((v, i) => `${i ? "L" : "M"}${(P + i / 95 * (W - 2 * P)).toFixed(1)},${(H - PB - v / max * (H - P - PB)).toFixed(1)}`).join("")}" fill="none" stroke="${s.color}" stroke-width="2"/>`).join("");
+  const ticks = [0, 6, 12, 18, 24].map(h => `<text x="${P + h / 24 * (W - 2 * P)}" y="${H - 2}" font-size="9" fill="#66706a" text-anchor="middle">${h}</text>`).join("");
+  return `<svg class="mini" viewBox="0 0 ${W} ${H}" role="img" aria-label="Tagesverlauf"><line x1="${P}" y1="${H - PB}" x2="${W - P}" y2="${H - PB}" stroke="#dfe3dc"/>${paths}${ticks}</svg>`;
+}
+
+// -------------------------------------------------------------------- EGs
+function profileOptions(sel) {
+  return `<option value="">– keine –</option>` + S.profiles.map(p => `<option value="${p}" ${p === sel ? "selected" : ""}>${esc(PROFILE_LABEL[p] || p)}</option>`).join("");
+}
+function flowBlock(c, key, title) {
+  const f = c[key] || {};
+  const r = f.dailyKwh || ["", ""];
+  return `<h3>${title}</h3>
+    <label class="f"><span>Profil</span><select data-eg="${c.uid}" data-flow="${key}" data-k="profile">${profileOptions(f.profile)}</select></label>
+    <label class="f"><span>Tagesmenge</span><div class="row"><input type="number" min="0" step="any" data-eg="${c.uid}" data-flow="${key}" data-k="min" value="${esc(r[0])}" ${f.profile ? "" : "disabled"}><span class="muted">bis</span><input type="number" min="0" step="any" data-eg="${c.uid}" data-flow="${key}" data-k="max" value="${esc(r[1])}" ${f.profile ? "" : "disabled"}><span class="muted">kWh</span></div></label>
+    <label class="f"><span>Schwankung</span><div class="row"><input type="number" min="0" max="100" data-eg="${c.uid}" data-flow="${key}" data-k="noise" value="${f.profile ? Math.round((f.noise ?? 0.15) * 100) : ""}" ${f.profile ? "" : "disabled"}><span class="muted">% je Intervall</span></div></label>`;
+}
+function renderEgs() {
+  const list = S.config.communities || [];
+  $("#egList").innerHTML = list.length ? list.map(c => {
+    const pe = c.priceExpectation;
+    const st = c.registeredStatus ? `<span class="chip ${c.registeredStatus === "ACTIVE" ? "ok" : "warn"}">${esc(c.registeredStatus)}</span>` : "";
+    const creds = (c.auth === "bearer" ? (c.email && c.password) : c.apiKey) ? `<span class="chip ok">Zugang hinterlegt</span>` : `<span class="chip warn">kein Zugang</span>`;
+    return `<div class="eg ${c.enabled === false ? "off" : ""}" id="eg-${c.uid}">
+      <div class="eg-head">
+        <input type="checkbox" title="aktiv" data-eg="${c.uid}" data-f="enabled" ${c.enabled !== false ? "checked" : ""}>
+        <input class="name" data-eg="${c.uid}" data-f="name" value="${esc(c.name)}">
+        ${st} ${creds}
+        <span class="spacer"></span>
+        <button class="b" data-act="register" data-uid="${c.uid}" title="POST /energy-communities">Registrieren</button>
+        ${S.mock ? `<button class="b" data-act="approve" data-uid="${c.uid}" title="nur im Mock: Admin schaltet frei">Mock: freischalten</button>` : ""}
+        <button class="b" data-act="test" data-uid="${c.uid}">Verbindung testen</button>
+        <button class="b" data-act="dup" data-uid="${c.uid}" title="duplizieren">⧉</button>
+        <button class="b danger" data-act="del" data-uid="${c.uid}" title="entfernen">✕</button>
+      </div>
+      <div class="eg-body">
+        <div>
+          <h3>Zugang</h3>
+          <label class="f"><span>E-Mail</span><input type="email" data-eg="${c.uid}" data-f="email" value="${esc(c.email)}" placeholder="kontakt@eg.example"></label>
+          <label class="f"><span>Beschreibung</span><input data-eg="${c.uid}" data-f="description" value="${esc(c.description)}"></label>
+          <label class="f"><span>Anmeldung</span><select data-eg="${c.uid}" data-f="auth"><option value="apiKey" ${c.auth !== "bearer" ? "selected" : ""}>API-Key (X-API-Key)</option><option value="bearer" ${c.auth === "bearer" ? "selected" : ""}>E-Mail + Passwort (Bearer-Token)</option></select></label>
+          <label class="f"><span>API-Key</span><input type="password" autocomplete="off" data-eg="${c.uid}" data-f="apiKey" value="${esc(c.apiKey)}" placeholder="vom Admin übergeben"></label>
+          <label class="f"><span>Passwort</span><input type="password" autocomplete="off" data-eg="${c.uid}" data-f="password" value="${esc(c.password)}" placeholder="vom Admin übergeben"></label>
+          <label class="f"><span>EG-ID</span><input class="mono" data-eg="${c.uid}" data-f="energyCommunityId" value="${esc(c.energyCommunityId)}" placeholder="wird bei Registrierung/Test gesetzt"></label>
+          <div class="eg-result" id="egres-${c.uid}"></div>
+        </div>
+        <div>
+          ${flowBlock(c, "generation", "Erzeugung")}
+          ${flowBlock(c, "consumption", "Verbrauch")}
+          <h3>Preisvorstellung (nur Angebote)</h3>
+          <label class="f"><span>Anteil</span><div class="row"><input type="number" min="0" max="100" data-eg="${c.uid}" data-pe="probability" value="${pe ? Math.round((pe.probability ?? 1) * 100) : 0}"><span class="muted">% der Angebote</span></div></label>
+          <label class="f"><span>Bereich</span><div class="row"><input type="number" min="0" step="0.001" data-eg="${c.uid}" data-pe="min" value="${pe ? esc(pe.range[0]) : "0.08"}"><span class="muted">bis</span><input type="number" min="0" step="0.001" data-eg="${c.uid}" data-pe="max" value="${pe ? esc(pe.range[1]) : "0.12"}"><span class="muted">EUR/kWh</span></div></label>
+          <label class="f"><span>Nachkommastellen</span><input type="number" min="0" max="5" data-eg="${c.uid}" data-pe="decimals" value="${pe ? (pe.decimals ?? 3) : 3}"></label>
+        </div>
+        <div>
+          <h3>Tagesverlauf</h3>
+          <div id="svg-${c.uid}">${profileSvg(c)}</div>
+          <div class="legend"><span><i style="background:#2f7d4f"></i>Erzeugung</span><span><i style="background:#c26a1b"></i>Verbrauch</span></div>
+          <p class="hint">Hat eine EG beides, meldet sie je Intervall den Saldo als Angebot oder Bedarf.</p>
+        </div>
+      </div>
+    </div>`;
+  }).join("") : `<div class="panel muted">Noch keine EG. Mit „+ EG hinzufügen“ anlegen.</div>`;
+  bindEgs();
+}
+function eg(uid) { return S.config.communities.find(c => c.uid === uid); }
+function bindEgs() {
+  $$("#egList [data-f]").forEach(el => el.oninput = el.onchange = () => {
+    const c = eg(el.dataset.eg); c[el.dataset.f] = el.type === "checkbox" ? el.checked : el.value;
+    if (el.dataset.f === "enabled") $("#eg-" + c.uid).classList.toggle("off", !el.checked);
+    if (el.dataset.f === "auth") renderEgs();
+    scheduleSave();
+  });
+  $$("#egList [data-flow]").forEach(el => el.oninput = el.onchange = () => {
+    const c = eg(el.dataset.eg), key = el.dataset.flow, k = el.dataset.k;
+    if (k === "profile") {
+      if (!el.value) c[key] = null;
+      else c[key] = Object.assign({ dailyKwh: [50, 100], noise: 0.15 }, c[key] || {}, { profile: el.value });
+      renderEgs(); scheduleSave(); return;
+    }
+    if (!c[key]) return;
+    if (k === "min") c[key].dailyKwh = [Number(el.value || 0), c[key].dailyKwh[1]];
+    if (k === "max") c[key].dailyKwh = [c[key].dailyKwh[0], Number(el.value || 0)];
+    if (k === "noise") c[key].noise = Number(el.value || 0) / 100;
+    $("#svg-" + c.uid).innerHTML = profileSvg(c);
+    scheduleSave();
+  });
+  $$("#egList [data-pe]").forEach(el => el.oninput = () => {
+    const c = eg(el.dataset.eg);
+    const box = $("#eg-" + c.uid);
+    const prob = Number($(`[data-pe=probability]`, box).value || 0) / 100;
+    c.priceExpectation = prob > 0 ? { probability: prob, range: [Number($(`[data-pe=min]`, box).value || 0), Number($(`[data-pe=max]`, box).value || 0)], decimals: parseInt($(`[data-pe=decimals]`, box).value || "3", 10) } : null;
+    scheduleSave();
+  });
+  $$("#egList [data-act]").forEach(b => b.onclick = () => egAction(b.dataset.act, b.dataset.uid, b));
+}
+async function egAction(act, uid, btn) {
+  const out = $("#egres-" + uid);
+  if (act === "del") { if (!confirm("EG aus der Konfiguration entfernen? Auf der Plattform bleibt sie bestehen.")) return; S.config.communities = S.config.communities.filter(c => c.uid !== uid); renderEgs(); return saveNow(); }
+  if (act === "dup") { const c = JSON.parse(JSON.stringify(eg(uid))); const n = await api("GET", "/api/config/default-community"); Object.assign(c, { uid: n.uid, name: c.name + " (Kopie)", apiKey: "", password: "", energyCommunityId: "", email: "", registeredStatus: undefined }); S.config.communities.push(c); renderEgs(); return saveNow(); }
+  await saveNow();
+  btn.disabled = true;
+  try {
+    if (act === "test") {
+      out.innerHTML = `<span class="muted">teste …</span>`;
+      const r = await api("POST", `/api/communities/${uid}/test`, {});
+      out.innerHTML = r.steps.map(s => `<div><span class="chip ${s.ok ? "ok" : "err"}">${s.ok ? "ok" : "Fehler"}</span> ${esc(s.step)} ${s.status != null ? `<b class="status-${String(s.status)[0]}">${s.status}</b>` : ""} <span class="muted">${esc(typeof s.detail === "object" && s.detail ? JSON.stringify(s.detail) : s.detail || "")}</span></div>`).join("");
+      if (r.energyCommunity) { const c = eg(uid); c.energyCommunityId = r.energyCommunity.id; c.registeredStatus = r.energyCommunity.status; await saveNow(); const keep = out.innerHTML; renderEgs(); $("#egres-" + uid).innerHTML = keep; }
+    } else if (act === "register") {
+      const c = eg(uid);
+      if (!c.email) { out.innerHTML = `<span class="chip err">E-Mail fehlt</span>`; return; }
+      if (c.energyCommunityId && !confirm("Diese EG hat schon eine ID. Trotzdem erneut registrieren?")) return;
+      const r = await api("POST", `/api/communities/${uid}/register`, {});
+      if (r.status === 201) {
+        S.config = r.config; renderEgs();
+        $("#egres-" + uid).innerHTML = `<div><span class="chip ok">201</span> registriert, Status ${esc(r.response.status)}. Jetzt muss der Admin die EG freischalten und API-Key/Passwort übergeben.</div>`;
+      } else {
+        out.innerHTML = `<div><span class="chip err">${r.status || "Fehler"}</span> ${esc(r.error || (r.response && (r.response.code + " – " + r.response.message)) || "")}</div>`;
+      }
+    } else if (act === "approve") {
+      const r = await api("POST", `/api/communities/${uid}/approve`, {});
+      S.config = r.config; renderEgs(); $("#egres-" + uid).innerHTML = `<span class="chip ok">freigeschaltet</span> Zugangsdaten eingetragen`;
+    }
+  } catch (e) { out.innerHTML = `<span class="chip err">Fehler</span> ${esc(e.message)}`; }
+  finally { btn.disabled = false; }
+}
+$("#btnAddEg").onclick = async () => {
+  const c = await api("GET", "/api/config/default-community");
+  c.name = "EG " + (S.config.communities.length + 1); c.consumption = { profile: "household", dailyKwh: [80, 140], noise: 0.15 };
+  S.config.communities.push(c); renderEgs(); saveNow();
+  $("#eg-" + c.uid).scrollIntoView({ behavior: "smooth" });
+};
+$("#btnTestAll").onclick = async () => { for (const c of S.config.communities.filter(c => c.enabled !== false)) { const b = $(`#eg-${c.uid} [data-act=test]`); if (b) await egAction("test", c.uid, b); } };
+$("#btnPlan").onclick = async () => {
+  await saveNow();
+  const out = $("#planOut"); out.hidden = false;
+  try {
+    const rows = await api("GET", "/api/plan?resolution=" + $("#planRes").value);
+    const byEg = {};
+    rows.forEach(r => { const k = r.community; byEg[k] = byEg[k] || { n: 0, o: 0, d: 0 }; byEg[k].n++; byEg[k][r.type === "OFFER" ? "o" : "d"] += Number(r.quantityKwh); });
+    out.innerHTML = `<h2>Vorschau (${rows.length} Positionen, Seed ${esc(S.config.run.seed ?? "zufällig")})</h2>
+      <table><thead><tr><th>EG</th><th>Positionen</th><th>Angebot kWh</th><th>Bedarf kWh</th></tr></thead><tbody>${Object.entries(byEg).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v.n}</td><td>${v.o.toFixed(3)}</td><td>${v.d.toFixed(3)}</td></tr>`).join("")}</tbody></table>
+      <details style="margin-top:10px"><summary>Alle Positionen als JSON</summary><pre class="json">${fmtJson(rows)}</pre></details>`;
+  } catch (e) { out.innerHTML = `<span class="chip err">Fehler</span> ${esc(e.message)}`; }
+};
+
+// -------------------------------------------------------------------- Lauf
+$("#btnRun").onclick = () => startRun("run");
+$("#btnVerify").onclick = () => startRun("verify");
+$("#btnStop").onclick = () => api("POST", "/api/run/stop", {});
+async function startRun(kind) {
+  await saveNow();
+  try {
+    S.logSince = 0; S.reqSince = 0; S.runRequests = []; $("#log").innerHTML = "";
+    S.run = await api("POST", "/api/run", { kind });
+    updateRunUi(); poll();
+  } catch (e) { appendLog([{ level: "ERROR", text: e.message }]); }
+}
+function appendLog(lines) {
+  const el = $("#log"); const atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+  el.insertAdjacentHTML("beforeend", lines.map(l => `<div class="${l.level}">${esc(l.text)}</div>`).join(""));
+  if (atEnd) el.scrollTop = el.scrollHeight;
+}
+async function poll() {
+  try {
+    const r = await api("GET", `/api/run?logSince=${S.logSince}&reqSince=${S.reqSince}`);
+    if (!r) return;
+    appendLog(r.logs); S.logSince = r.logTotal;
+    if (r.requests.length) { S.runRequests.push(...r.requests); S.reqSince = r.requests[r.requests.length - 1].seq; if ($("#tab-requests").classList.contains("active")) renderRequests(); }
+    S.run = r; updateRunUi();
+    if (r.status === "running") return setTimeout(poll, 1000);
+    if (r.report) { S.report = r.report; renderReport(r.report, r.reportFile); appendLog([{ level: "INFO", text: `— fertig: ${r.report.totals.errors} Fehler, ${r.report.totals.checksFailed} fehlgeschlagene Checks. Details im Tab „Ergebnis“.` }]); }
+    if (r.error) appendLog([{ level: "ERROR", text: r.error }]);
+  } catch (e) { setTimeout(poll, 2000); }
+}
+function updateRunUi() {
+  const running = S.run && S.run.status === "running";
+  $("#btnStop").disabled = !running;
+  $("#btnRun").disabled = $("#btnVerify").disabled = running || !$("#configError").hidden;
+  const chip = $("#runChip");
+  const st = S.run ? S.run.status : "idle";
+  const t = S.run && S.run.report ? S.run.report.totals : null;
+  chip.className = "chip " + (st === "running" ? "info" : st === "error" ? "err" : t ? (t.errors || t.checksFailed ? "err" : "ok") : "");
+  chip.textContent = st === "running" ? "läuft …" : st === "stopped" ? "abgebrochen" : st === "error" ? "Fehler" : t ? (t.errors || t.checksFailed ? `${t.errors + t.checksFailed} Befunde` : "alles ok") : "bereit";
+  $("#liveInfo").textContent = S.run && S.run.live ? `${S.run.live.requests} Requests · ${S.run.live.serverErrors} Server-/Verbindungsfehler` : "";
+}
+
+// ---------------------------------------------------------------- Ergebnis
+async function loadReportList() {
+  try {
+    const list = await api("GET", "/api/reports");
+    const sel = $("#repSelect"); const cur = sel.value;
+    sel.innerHTML = `<option value="">Letzter Lauf (diese Sitzung)</option>` + list.map(r => `<option value="${esc(r.file)}">${esc(r.file.replace("egsim-", "").replace(".json", ""))} · ${r.mode === "verify" ? "Prüfung" : "Lauf"} · ${r.totals ? r.totals.errors + " Fehler, " + r.totals.checksFailed + " Checks rot" : ""}</option>`).join("");
+    sel.value = cur;
+  } catch (_) {}
+}
+$("#repSelect").onchange = async () => {
+  const f = $("#repSelect").value;
+  if (!f) { if (S.report) renderReport(S.report, S.run && S.run.reportFile); return; }
+  renderReport(await api("GET", "/api/reports/" + encodeURIComponent(f)), f);
+};
+function renderReport(rep, file) {
+  const t = rep.totals;
+  const dl = $("#repDownload");
+  if (file) { dl.hidden = false; dl.href = "/api/reports/" + encodeURIComponent(file); dl.download = file; } else dl.hidden = true;
+  const card = (v, l, cls) => `<div class="card ${cls}"><b>${v}</b><span>${l}</span></div>`;
+  const markets = rep.markets.map(m => {
+    const v = m.verification;
+    return `<tr><td>${esc(m.deliveryDate)}</td><td>${esc(m.resolution || "–")}</td><td>${esc(m.marketStatusAtStart || "–")} → ${esc(m.marketStatusAtEnd || "–")}</td>
+      <td>${m.positionsSubmitted}/${m.positionsPlanned}${m.submissionsFailed ? ` <span class="chip err">${m.submissionsFailed} abgelehnt</span>` : ""}</td><td>${m.updates}</td><td>${m.cancellations}</td>
+      <td>${esc(m.offersKwh)} / ${esc(m.demandKwh)}</td>
+      <td>${v ? `<span class="chip ${v.status === "OK" ? "ok" : "err"}">${esc(v.status)}</span> <span class="muted">${v.mode === "full" ? "vollständig nachgerechnet" : "EG-Sicht"}, ${v.comparisons} Vergleiche</span>` : `<span class="muted">–</span>`}</td></tr>
+      ${v && v.reference ? `<tr><td></td><td colspan="7" class="muted">Referenz: Einkauf ${esc(v.reference.purchaseCostEur)} €, Verkauf ${esc(v.reference.salesRevenueEur)} €, Reserve ${esc(v.reference.reserveDispatchedKwh)} kWh / ${esc(v.reference.reserveCostEur)} €, Marge ${esc(v.reference.marginEur)} €</td></tr>` : ""}`;
+  }).join("");
+  const comms = rep.communities.map(c => `<tr><td>${esc(c.name)}</td><td class="mono">${esc(c.id || "–")}</td><td>${c.ready ? `<span class="chip ok">angemeldet</span>` : `<span class="chip warn">${esc(c.problem || "nicht angemeldet")}</span>`}</td></tr>`).join("");
+  $("#resultOut").innerHTML = `
+    ${rep.stopped ? `<div class="banner warn">Lauf wurde abgebrochen – Ergebnis unvollständig.</div>` : ""}
+    <div class="cards">
+      ${card(t.errors, "Fehler", t.errors ? "err" : "ok")}${card(t.warnings, "Warnungen", t.warnings ? "warn" : "")}
+      ${card(t.checksPassed, "Checks bestanden", "ok")}${card(t.checksFailed, "Checks fehlgeschlagen", t.checksFailed ? "err" : "")}${card(t.requests, "Requests", "")}
+    </div>
+    <div class="panel"><h2>Märkte</h2><table><thead><tr><th>Liefertag</th><th>Auflösung</th><th>Status</th><th>Positionen</th><th>geändert</th><th>storniert</th><th>Angebot / Bedarf kWh</th><th>Ergebnisprüfung</th></tr></thead><tbody>${markets || `<tr><td colspan="8" class="muted">keine</td></tr>`}</tbody></table></div>
+    <div class="grid cols-2" style="margin-top:16px">
+      <div class="panel"><h2>Befunde</h2><div class="toolbar"><label><input type="checkbox" id="fOnlyErr" checked> nur Fehler und Warnungen</label></div><div class="scroll" id="findings"></div></div>
+      <div class="panel"><h2>Checks</h2><div class="toolbar"><select id="cFilter" style="width:auto"><option value="FAIL">fehlgeschlagen</option><option value="">alle</option><option value="SKIP">übersprungen</option></select></div><div class="scroll" id="checks"></div></div>
+    </div>
+    <div class="grid cols-2" style="margin-top:16px">
+      <div class="panel"><h2>EGs</h2><table><tbody>${comms}</tbody></table></div>
+      <div class="panel"><h2>Endpoints</h2><div class="scroll" style="max-height:300px"><table><thead><tr><th>Endpoint</th><th>Anzahl</th><th>Status</th><th>p50 / p95 ms</th></tr></thead><tbody>${rep.requests.map(r => `<tr><td class="mono">${esc(r.method)} ${esc(r.endpoint)}</td><td>${r.requests}</td><td class="mono">${Object.entries(r.statusCounts).map(([k, v]) => `<span class="status-${k[0]}">${k}</span>×${v}`).join(" ")}</td><td>${r.latencyMs.p50} / ${r.latencyMs.p95}</td></tr>`).join("")}</tbody></table></div></div>
+    </div>
+    <p class="muted" style="margin-top:12px">Lauf ${esc(rep.runId)} · Seed ${esc(rep.seed)} · ${esc(rep.baseUrl)} · Datenvertrag ${esc(rep.contractVersion)}</p>`;
+  const renderFindings = () => {
+    const only = $("#fOnlyErr").checked;
+    const fs = rep.findings.filter(f => !only || f.severity !== "info");
+    $("#findings").innerHTML = fs.length ? `<table><tbody>${fs.map(f => `<tr><td><span class="chip ${f.severity === "error" ? "err" : f.severity === "warning" ? "warn" : "info"}">${esc(f.area)}</span></td><td>${esc(f.message)}${f.request ? `<div class="mono muted">${esc(f.request)}</div>` : ""}</td></tr>`).join("")}</tbody></table>` : `<span class="muted">keine</span>`;
+  };
+  const renderChecks = () => {
+    const flt = $("#cFilter").value;
+    const cs = rep.checks.filter(c => !flt || c.result === flt);
+    $("#checks").innerHTML = cs.length ? `<table><thead><tr><th>ID</th><th>Check</th><th>Erwartet</th><th>Erhalten</th></tr></thead><tbody>${cs.map(c => `<tr><td><span class="chip ${c.result === "PASS" ? "ok" : c.result === "FAIL" ? "err" : ""}">${esc(c.id)}</span></td><td>${esc(c.title)}${c.note ? `<div class="muted">${esc(c.note)}</div>` : ""}</td><td class="mono">${esc(c.expected)}</td><td class="mono">${esc(c.actualStatus ?? "")} ${esc(c.actualCode ?? "")}</td></tr>`).join("")}</tbody></table>` : `<span class="muted">${flt === "FAIL" ? "Alle Checks bestanden." : "keine"}</span>`;
+  };
+  $("#fOnlyErr").onchange = renderFindings; $("#cFilter").onchange = renderChecks;
+  renderFindings(); renderChecks();
+}
+
+// ---------------------------------------------------------------- Requests
+$("#rqSource").onchange = async () => { if ($("#rqSource").value === "manual") await loadManualLog(); renderRequests(); };
+$("#rqFilter").oninput = renderRequests; $("#rqErrors").onchange = renderRequests;
+async function loadManualLog() {
+  const add = await api("GET", "/api/manual/log?since=" + S.manualSince);
+  if (add.length) { S.manualRequests.push(...add); S.manualSince = add[add.length - 1].seq; }
+}
+function renderRequests() {
+  const src = $("#rqSource").value === "manual" ? S.manualRequests : S.runRequests;
+  const q = $("#rqFilter").value.toLowerCase(), errs = $("#rqErrors").checked;
+  const rows = src.filter(r => (!errs || r.status === 0 || r.status >= 400) && (!q || `${r.actor} ${r.method} ${r.path} ${r.status} ${JSON.stringify(r.response)}`.toLowerCase().includes(q)));
+  $("#rqCount").textContent = `${rows.length} von ${src.length}`;
+  const shown = rows.slice(-1000).reverse();
+  $("#rqList").innerHTML = shown.map(r => `<tr class="click ${S.selReq === r.seq ? "sel" : ""}" data-seq="${r.seq}"><td class="mono">${esc(r.time)}</td><td>${esc(r.actor)}</td><td class="mono">${esc(r.method)} ${esc(r.path)}</td><td class="status-${String(r.status)[0]}">${r.status || "—"}</td><td>${r.ms}</td></tr>`).join("");
+  $$("#rqList tr").forEach(tr => tr.onclick = () => { S.selReq = +tr.dataset.seq; const r = src.find(x => x.seq === S.selReq); showRequest(r); $$("#rqList tr").forEach(x => x.classList.toggle("sel", x === tr)); });
+}
+function showRequest(r) {
+  $("#rqDetail").innerHTML = `<div class="kv"><div>Request</div><div class="mono">${esc(r.method)} ${esc(r.path)}</div>
+    ${r.query ? `<div>Query</div><div class="mono">${esc(new URLSearchParams(r.query).toString())}</div>` : ""}
+    <div>EG</div><div>${esc(r.actor)}</div><div>Status</div><div class="status-${String(r.status)[0]}">${r.status || esc(r.error)}</div><div>Dauer</div><div>${r.ms} ms</div></div>
+    ${r.request != null ? `<h3>Request-Body</h3><pre class="json">${fmtJson(r.request)}</pre>` : ""}
+    <h3>Antwort</h3><pre class="json">${r.response != null ? fmtJson(r.response) : "(leer)"}</pre>`;
+}
+
+// ---------------------------------------------------------------- Manuell
+function isoDate(spec) {
+  const s = String(spec || "tomorrow").trim().toLowerCase();
+  const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Vienna" });
+  const add = s === "today" ? 0 : s === "tomorrow" ? 1 : /^\+\d+$/.test(s) ? parseInt(s.slice(1), 10) : null;
+  if (add === null) return spec;
+  const d = new Date(today + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() + add);
+  return d.toISOString().slice(0, 10);
+}
+const TEMPLATES = {
+  submitPosition: () => ({ deliveryDate: isoDate((S.config.run.deliveryDates || ["tomorrow"])[0]), type: "OFFER", quantityKwh: 100, priceExpectationEurPerKwh: 0.09 }),
+  updatePosition: () => ({ quantityKwh: 90, priceExpectationEurPerKwh: 0.09 }),
+  updateCommunity: () => ({ description: "Geändert über EGSim" }),
+};
+const NEEDS = {
+  me: [], getCommunity: [], updateCommunity: ["body"], market: ["date"], submitPosition: ["body"],
+  listPositions: ["query:deliveryDate,intervalStart,type,status,energyCommunityId"], getPosition: ["id"], updatePosition: ["id", "body"],
+  cancelPosition: ["id"], allocations: ["date", "query:intervalStart,energyCommunityId"], trades: ["date", "query:direction,intervalStart,positionId,energyCommunityId"],
+  raw: ["method", "path", "body", "query:"],
+};
+function renderManualEgs() {
+  const sel = $("#mEg"); const cur = sel.value;
+  sel.innerHTML = S.config.communities.map(c => `<option value="${c.uid}">${esc(c.name)}</option>`).join("");
+  if (cur) sel.value = cur;
+  renderManualFields();
+}
+function renderManualFields() {
+  const a = $("#mAction").value; const needs = NEEDS[a] || [];
+  const date = isoDate((S.config.run.deliveryDates || ["tomorrow"])[0]);
+  let h = "";
+  for (const n of needs) {
+    if (n === "date") h += `<label class="f"><span>deliveryDate</span><input id="mDate" value="${esc(date)}"></label>`;
+    if (n === "id") h += `<label class="f"><span>Positions-ID</span><input id="mId" class="mono" placeholder="UUID"></label>`;
+    if (n === "method") h += `<label class="f"><span>Methode</span><select id="mMethod"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option></select></label>`;
+    if (n === "path") h += `<label class="f"><span>Pfad</span><input id="mPath" class="mono" value="/positions"></label>`;
+    if (n === "body") h += `<label class="f" style="align-items:start"><span>Body (JSON)</span><textarea id="mBody">${TEMPLATES[a] ? esc(JSON.stringify(TEMPLATES[a](), null, 2)) : ""}</textarea></label>`;
+    if (n.startsWith("query:")) {
+      const keys = n.slice(6).split(",").filter(Boolean);
+      h += `<label class="f" style="align-items:start"><span>Query</span><textarea id="mQuery" style="min-height:60px" placeholder="schluessel=wert, eine Zeile je Parameter">${keys.map(k => k + "=" + (k === "deliveryDate" ? date : "")).join("\n")}</textarea></label>`;
+    }
+  }
+  h += `<p class="hint">Der Request läuft mit den Zugangsdaten der gewählten EG. Ungültige Werte werden bewusst unverändert gesendet.${a === "submitPosition" ? " Im 15-Minuten-Markt zusätzlich <span class=\"mono\">intervalStart</span> angeben, z. B. \"" + date + "T11:15:00Z\"." : ""}</p>`;
+  $("#mFields").innerHTML = h;
+}
+$("#mAction").onchange = renderManualFields;
+$("#mSend").onclick = async () => {
+  await saveNow();
+  const a = $("#mAction").value;
+  const query = {};
+  ($("#mQuery")?.value || "").split("\n").forEach(l => { const i = l.indexOf("="); if (i > 0) { const v = l.slice(i + 1).trim(); if (v) query[l.slice(0, i).trim()] = v; } });
+  const payload = { uid: $("#mEg").value, action: a, params: { date: $("#mDate")?.value, id: $("#mId")?.value }, body: $("#mBody")?.value, query, method: $("#mMethod")?.value, path: $("#mPath")?.value };
+  $("#mInfo").textContent = "sende …";
+  try {
+    const r = await api("POST", "/api/manual", payload);
+    $("#mInfo").textContent = "";
+    if (r.error && !r.status) { $("#mResult").innerHTML = `<span class="chip err">Fehler</span> ${esc(r.error)}`; return; }
+    $("#mResult").innerHTML = `<div class="kv"><div>Request</div><div class="mono">${esc(r.method)} ${esc(r.path)}${r.query ? "?" + esc(new URLSearchParams(r.query).toString()) : ""}</div><div>Status</div><div class="status-${String(r.status)[0]}">${r.status || esc(r.error)}</div><div>Dauer</div><div>${r.ms} ms</div></div>
+      <pre class="json">${r.response != null ? fmtJson(r.response) : "(leer)"}</pre>`;
+    const id = r.response && r.response.id; if (id && $("#mId") === null && a === "submitPosition") $("#mInfo").textContent = "Positions-ID: " + id;
+  } catch (e) { $("#mInfo").textContent = ""; $("#mResult").innerHTML = `<span class="chip err">Fehler</span> ${esc(e.message)}`; }
+};
+
+// ------------------------------------------------------------------- Mock
+async function loadMockMarkets() {
+  const ms = await api("GET", "/api/mock/markets");
+  $("#mkList").innerHTML = ms.map(m => `<tr><td>${esc(m.deliveryDate)}</td><td>${esc(m.resolution)}</td><td><span class="chip ${m.status === "SETTLED" ? "ok" : m.status === "OPEN" ? "info" : "warn"}">${esc(m.status)}</span></td><td class="mono">${esc(m.closesAt)}</td><td>${esc(m.prices.buyPriceEurPerKwh)} / ${esc(m.prices.sellPriceEurPerKwh)} / ${esc(m.prices.reservePriceEurPerKwh)}</td><td>${m.status === "OPEN" || m.status === "FAILED" ? `<button class="b" data-close="${esc(m.deliveryDate)}">jetzt schließen</button>` : ""}</td></tr>`).join("");
+  $$("#mkList [data-close]").forEach(b => b.onclick = async () => { await api("POST", `/api/mock/markets/${b.dataset.close}/close`, {}); loadMockMarkets(); });
+}
+$("#mkAdd").onclick = async () => { try { await api("POST", "/api/mock/markets", { date: $("#mkDate").value || "+3", resolution: $("#mkRes").value, closesInMinutes: $("#mkMin").value }); loadMockMarkets(); } catch (e) { alert(e.message); } };
+$("#mkCapSet").onclick = async () => { await api("PUT", "/api/mock/reserve", { capacityKwh: $("#mkCap").value }); };
+
+// ------------------------------------------------------------------- Start
+(async function init() {
+  const st = await api("GET", "/api/state");
+  S.config = st.config; S.profiles = st.profiles; S.mock = st.mock;
+  S.config.run = S.config.run || {}; S.config.behaviour = S.config.behaviour || {}; S.config.platform = S.config.platform || {}; S.config.communities = S.config.communities || [];
+  document.title = `EGSim ${st.version}`;
+  $("#saveState").textContent = st.configPath;
+  if (st.mock) { $("#mockBanner").hidden = false; $("#mockBanner").innerHTML = `Demo-Modus: Die UI spricht mit dem eingebauten Mock unter <span class="mono">${esc(st.mockUrl)}</span>. Märkte schließen automatisch zu closesAt (Steuerung im Tab „Manuell“).`; $("#mockPanel").hidden = false; }
+  bindRunForm(); renderEgs(); renderManualEgs(); showConfigError(st.configError);
+  if (st.run) {
+    S.run = st.run; S.logSince = 0; S.reqSince = 0; updateRunUi();
+    if (st.run.status === "running") poll();
+    else { const r = await api("GET", "/api/run?logSince=0&reqSince=0"); appendLog(r.logs); S.logSince = r.logTotal; S.runRequests = r.requests; if (r.report) { S.report = r.report; renderReport(r.report, r.reportFile); } }
+  }
+})();
+</script>
+</body>
+</html>

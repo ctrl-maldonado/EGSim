@@ -1,69 +1,99 @@
-"""Ende-zu-Ende: Simulator gegen den Mock – einmal korrekt, einmal mit eingebauten Fehlern."""
+"""Ende-zu-Ende: Simulator (ohne Admin) gegen den Mock – korrekt und mit eingebauten Fehlern."""
+import json
+import threading
+import time
+import urllib.request
 from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 
-from egsim.config import parse_config
-from egsim.mockserver import ApiErr, MockPlatform, start_server
+from egsim.config import default_config_dict, new_community_dict, parse_config
+from egsim.mockserver import ApiErr, MockPlatform, _check_uuid, start_server
 from egsim.simulator import Simulator
 from egsim.timeutil import now_utc, resolve_delivery_date
 
-
-def _config(port, resolution_date="tomorrow", tmp_path=None, **run):
-    return parse_config({
-        "platform": {"baseUrl": f"http://127.0.0.1:{port}"},
-        "admin": {"apiKey": "admin-key"},
-        "run": {"seed": 1, "deliveryDates": [resolution_date], "concurrency": 4, "closeMarket": True,
-                "reportFile": None, **run},
-        "provisioning": {"mode": "register", "stateFile": str(tmp_path / "state.json") if tmp_path else None},
-        "behaviour": {"updateProbability": 0.3, "cancelProbability": 0.2, "quarterHour": {"intervals": 12}},
-        "communities": [
-            {"name": "PV", "count": 2, "generation": {"profile": "solar", "dailyKwh": [40, 80]},
-             "priceExpectation": {"probability": 0.7, "range": [0.08, 0.12]}},
-            {"name": "Wind", "generation": {"profile": "wind", "dailyKwh": [20, 60]}},
-            {"name": "Haushalte", "count": 2, "consumption": {"profile": "household", "dailyKwh": [50, 90]}},
-        ],
-    })
+FLOWS = [
+    {"generation": {"profile": "solar", "dailyKwh": [40, 80]}, "priceExpectation": {"probability": 0.7, "range": [0.08, 0.12]}},
+    {"generation": {"profile": "wind", "dailyKwh": [20, 60]}},
+    {"consumption": {"profile": "household", "dailyKwh": [80, 140]}},
+    {"consumption": {"profile": "business", "dailyKwh": [50, 90]}},
+]
 
 
-def _run(platform, resolution="DAY", tmp_path=None, **run):
+def _setup(platform, resolution="DAY", closes_in=timedelta(hours=1), n=4, auth="apiKey", **run):
     d = resolve_delivery_date("tomorrow").isoformat()
-    platform.add_market(d, resolution, closes_at=now_utc() + timedelta(hours=1))
+    platform.add_market(d, resolution, closes_at=now_utc() + closes_in)
     srv = start_server(platform)
-    try:
-        return Simulator(_config(srv.server_address[1], d, tmp_path, **run)).run()
-    finally:
-        srv.shutdown()
+    raw = default_config_dict()
+    raw["platform"]["baseUrl"] = f"http://127.0.0.1:{srv.server_address[1]}"
+    raw["run"].update({"seed": 1, "deliveryDates": [d], "reportDir": None, **run})
+    raw["behaviour"].update({"updateProbability": 0.3, "cancelProbability": 0.3, "quarterHour": {"intervals": 12}})
+    raw["communities"] = []
+    for i in range(n):
+        eg = platform.add_demo_community(f"EG {i}")
+        raw["communities"].append(new_community_dict(eg["name"], email=eg["email"], apiKey=eg["apiKey"],
+                                                     password=eg["password"], auth=auth, **FLOWS[i % len(FLOWS)]))
+    return srv, raw, d
 
 
 @pytest.mark.parametrize("resolution", ["DAY", "QUARTER_HOUR"])
-def test_korrekte_plattform_ohne_befunde(resolution, tmp_path):
-    rep = _run(MockPlatform(), resolution, tmp_path)
-    assert rep["totals"]["errors"] == 0, rep["findings"]
+def test_korrekte_plattform_ohne_befunde(resolution):
+    p = MockPlatform()
+    srv, raw, d = _setup(p, resolution, allParticipantsSimulated=True)
+    try:
+        # Betreiber schließt den Markt, während der Simulator wartet
+        raw_cfg = parse_config({**raw, "run": {**raw["run"], "waitForSettlementMinutes": 1}})
+        threading.Timer(3, p.close_market, args=(d,)).start()
+        rep = Simulator(raw_cfg).run()
+    finally:
+        srv.shutdown()
+    assert rep["totals"]["errors"] == 0, [f for f in rep["findings"] if f["severity"] != "info"]
     assert rep["totals"]["checksFailed"] == 0
     assert rep["totals"]["checksPassed"] > 60
     m = rep["markets"][0]
     assert m["marketStatusAtEnd"] == "SETTLED"
-    assert m["verification"]["status"] == "OK"
+    assert m["verification"]["status"] == "OK" and m["verification"]["mode"] == "full"
 
 
-def test_reserve_knapp_und_asynchrones_settlement(tmp_path):
-    rep = _run(MockPlatform(reserve_capacity=Decimal("1"), settlement_delay=1.5), "DAY", tmp_path)
-    assert rep["totals"]["errors"] == 0, rep["findings"]
-    assert rep["markets"][0]["closeHttpStatus"] == 202
+def test_login_per_bearer_und_reserve_knapp():
+    p = MockPlatform(reserve_capacity=Decimal("1"))
+    srv, raw, d = _setup(p, auth="bearer", allParticipantsSimulated=True)
+    try:
+        Simulator(parse_config(raw)).run()          # einreichen
+        p.close_market(d)
+        rep = Simulator(parse_config(raw)).verify_only()  # später nur prüfen
+    finally:
+        srv.shutdown()
+    assert rep["totals"]["errors"] == 0, [f for f in rep["findings"] if f["severity"] != "info"]
     assert rep["markets"][0]["verification"]["status"] == "OK"
+
+
+def test_ohne_zugangsdaten_und_nicht_freigeschaltet():
+    p = MockPlatform()
+    srv, raw, d = _setup(p, n=1)
+    pending = p.add_demo_community("Pending")
+    p.ecs[pending["id"]]["status"] = "PENDING"
+    raw["communities"].append(new_community_dict("Ohne Key", consumption={"profile": "flat", "dailyKwh": 5}))
+    raw["communities"].append(new_community_dict("Pending", apiKey=pending["apiKey"], consumption={"profile": "flat", "dailyKwh": 5}))
+    try:
+        rep = Simulator(parse_config(raw)).run()
+    finally:
+        srv.shutdown()
+    status = {c["name"]: c for c in rep["communities"]}
+    assert status["Ohne Key"]["problem"] == "keine Zugangsdaten"
+    assert "ENERGY_COMMUNITY_NOT_ACTIVE" in status["Pending"]["problem"]
+    assert status["EG 0"]["ready"]
 
 
 class KaputtePlattform(MockPlatform):
     """Typische Fehler: keine Eigentümerprüfung bei Positionen, falsche Zuteilungsmenge."""
 
     def _load_position(self, role, ec, raw_id):
-        from egsim.mockserver import _check_uuid
         p = self.positions.get(_check_uuid(raw_id))
         if not p:
             raise ApiErr("POSITION_NOT_FOUND")
-        return p  # Mandantentrennung fehlt
+        return p
 
     def _settle(self, d):
         super()._settle(d)
@@ -73,9 +103,51 @@ class KaputtePlattform(MockPlatform):
                 break
 
 
-def test_kaputte_plattform_wird_erkannt(tmp_path):
-    rep = _run(KaputtePlattform(), "DAY", tmp_path, lifecycleChecks=False)
+def test_kaputte_plattform_wird_erkannt():
+    p = KaputtePlattform()
+    srv, raw, d = _setup(p)
+    try:
+        threading.Timer(2, p.close_market, args=(d,)).start()
+        rep = Simulator(parse_config({**raw, "run": {**raw["run"], "waitForSettlementMinutes": 1}})).run()
+    finally:
+        srv.shutdown()
     failed = {c["id"] for c in rep["checks"] if c["result"] == "FAIL"}
     assert {"TEN-03", "TEN-04"} <= failed
     assert rep["markets"][0]["verification"]["status"] == "MISMATCH"
-    assert rep["totals"]["errors"] > 0
+
+
+def test_ui_api_lauf(tmp_path):
+    from http.server import ThreadingHTTPServer
+
+    from egsim.ui.server import UiState, make_handler
+    p = MockPlatform()
+    srv, raw, d = _setup(p, n=2)
+    state = UiState(tmp_path / "egsim-ui.json")
+    ui = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    threading.Thread(target=ui.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{ui.server_address[1]}"
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(base + path, method=method, headers={"Content-Type": "application/json"},
+                                     data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+    try:
+        assert "EGSim" in urllib.request.urlopen(base + "/").read().decode()
+        assert call("PUT", "/api/config", raw)["configError"] is None
+        assert (tmp_path / "egsim-ui.json").exists()
+        uid = raw["communities"][0]["uid"]
+        assert call("POST", f"/api/communities/{uid}/test", {})["ok"] is True
+        r = call("POST", "/api/manual", {"uid": uid, "action": "market", "params": {"date": d}})
+        assert r["status"] == 200 and r["response"]["deliveryDate"] == d
+        call("POST", "/api/run", {"kind": "run"})
+        for _ in range(100):
+            run = call("GET", "/api/run?logSince=0&reqSince=0")
+            if run["status"] != "running":
+                break
+            time.sleep(0.2)
+        assert run["status"] == "done" and run["report"]["totals"]["errors"] == 0
+        assert run["requests"] and any("angemeldet" in line["text"] for line in run["logs"])
+    finally:
+        ui.shutdown()
+        srv.shutdown()
