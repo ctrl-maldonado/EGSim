@@ -47,6 +47,10 @@ def format_summary(report: dict) -> str:
             if ref:
                 lines.append(f"  Referenz: Einkauf {ref['purchaseCostEur']} €, Verkauf {ref['salesRevenueEur']} €, "
                              f"Reserve {ref['reserveDispatchedKwh']} kWh / {ref['reserveCostEur']} €, Marge {ref['marginEur']} €")
+    for sc in report.get("scenarios") or []:
+        mark = {"PASS": "✓", "FAIL": "✗"}.get(sc["result"], "·")
+        lines.append(f"  {mark} {sc['id']} {sc['title']}: {sc['result']}"
+                     + (f" – {sc['messages'][0]}" if sc["messages"] and sc["result"] != "PASS" else ""))
     lines.append(f"Checks: {t['checksPassed']} bestanden, {t['checksFailed']} fehlgeschlagen, {t['checksSkipped']} übersprungen")
     for c in report["checks"]:
         if c["result"] == "FAIL":

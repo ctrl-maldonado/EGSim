@@ -1,0 +1,5 @@
+# HTTPS mit automatischem Let's-Encrypt-Zertifikat. Die Domain muss per DNS auf den VPS zeigen.
+{$EGSIM_DOMAIN} {
+	encode gzip
+	reverse_proxy egsim:8090
+}

@@ -1,153 +1,192 @@
 # EGSim – Dummy-Energiegemeinschaften für die Handelsplattform
 
 EGSim simuliert Energiegemeinschaften (EGs), die mit eurer Handelsplattform sprechen (**Datenvertrag 0.2**).
-Er verhält sich wie eine echte EG: Er meldet sich mit den Zugangsdaten der EG an, reicht Angebote und Bedarfe ein,
-ändert und storniert sie und holt nach dem Settlement Zuteilungen und Handelsabschlüsse ab. Dabei prüft er,
-ob jede Antwort zum Vertrag passt, und führt rund 75 Negativtests aus (Fehlercodes, Rollen, Mandantentrennung,
-Validierung).
+Er verhält sich wie echte EGs: Er meldet sich an, reicht Angebote und Bedarfe ein, ändert und storniert sie und holt
+nach dem Settlement Zuteilungen und Handelsabschlüsse ab. Dabei prüft er jede Antwort gegen den Vertrag. Dazu kommen
+rund 100 Negativtests (Fehlercodes, Rollen, Mandantentrennung, Validierung) und ein **Katalog gezielter Randfälle**.
 
-EGSim hat **keinen Admin-Zugang** und nutzt nur Endpoints, die die Rolle `ENERGY_COMMUNITY` darf.
-Märkte schließen und abwickeln macht euer Betreiber.
-
-Konfiguriert und gestartet wird alles über eine **Web-UI**.
+Bedient wird alles über eine **Web-UI**.
 
 ## Schnellstart
 
 ```bash
 pip install -e ".[dev]"          # Python ≥ 3.10, einzige Abhängigkeit: requests
 
-egsim ui --open                  # UI auf http://localhost:8090, Konfiguration in egsim-ui.json
+egsim ui --mock --open           # Demo: eingebauter Mock der Plattform, alles vorkonfiguriert
+egsim ui --open                  # gegen eure Plattform; Konfiguration in egsim-ui.json
 ```
 
-Ohne eure Plattform ausprobieren:
+Der Mock setzt den Datenvertrag vollständig um. Damit lassen sich Simulator und Vertrag testen, solange eure
+Plattform noch nicht steht. Sobald sie läuft, tragt ihr in der UI ihre Adresse ein, z. B. `http://localhost:8080`.
 
-```bash
-egsim ui --mock --open           # eingebauter Mock mit 3 freigeschalteten Demo-EGs
-```
+## Warum die Plattform die EGs kennen muss
 
-Im Demo-Modus schließt der Mock den Markt für morgen nach 3 Minuten selbst. Der Lauf wartet darauf und prüft
-danach die Ergebnisse. Im Tab „Manuell“ lassen sich im Demo-Modus weitere Märkte anlegen und sofort schließen.
+Der Simulator schickt Daten, als wäre er eine EG. Laut Datenvertrag braucht aber jede Anfrage einer EG einen API-Key
+oder ein Token. Die Plattform erkennt daran, *welche* EG spricht: Jede Position bekommt deren `energyCommunityId`,
+Zuteilungen und Trades gehören zu ihr, und keine EG darf fremde Daten sehen. Unbekannte Schlüssel lehnt die Plattform
+mit 401 ab. Die EG muss also **auf der Plattform** existieren. Im Simulator selbst wird nichts eingerichtet.
+
+Dafür gibt es drei Wege:
+
+1. **Admin-Key der Test-Plattform in der UI eintragen (empfohlen).** EGSim legt die EGs beim Start selbst an
+   (`POST /energy-communities`), schaltet sie frei und holt die Zugangsdaten. Pro EG reichen Name und Lastprofil.
+2. **Feste Test-EGs in eurer Plattform** (Seed-Daten im Dev-Modus) und deren API-Keys in EGSim eintragen.
+3. **Ohne Admin:** In der UI „Registrieren“ klicken, der Admin schaltet die EG frei und übergibt die Zugangsdaten.
+
+Mit Admin-Key kann EGSim außerdem den Markt selbst schließen, das komplette Tagesergebnis (`/result`) nachrechnen
+und die Admin-Checks ausführen. Den Admin-Key nur bei Test-Plattformen eintragen.
 
 ## Die UI
 
 | Tab | Inhalt |
 |---|---|
-| **Lauf** | Plattform-URL, Liefertage, Verhalten (Seed, Parallelität, Änderungen, Stornos, 15-Min-Intervalle), Prüfungen. Lauf starten/abbrechen mit Live-Log. „Nur Ergebnisse prüfen“ holt nach einem späteren Marktschluss die Ergebnisse ab. |
-| **Energiegemeinschaften** | EGs anlegen, duplizieren, (de)aktivieren. Zugang (API-Key oder E-Mail/Passwort), Erzeugung und Verbrauch mit Lastprofil und Tagesmenge, Preisvorstellung. Tagesverlauf als Grafik. Buttons **Registrieren** und **Verbindung testen**. Vorschau der Positionen, die ein Lauf einreichen würde. |
-| **Manuell** | Einzelne Requests als gewählte EG senden: vorgefertigte Aktionen für alle EG-Endpoints oder ein freier Request (auch mit absichtlich kaputtem JSON). |
-| **Ergebnis** | Fehler, Warnungen, Checks, Märkte, Ergebnisprüfung, Latenz je Endpoint. Frühere Berichte auswählen und als JSON herunterladen. |
-| **Requests** | Jeder Request mit Body und Antwort, filterbar (z. B. nur ≥ 400). API-Keys, Passwörter und Tokens werden ausgeblendet. |
+| **Lauf** | Plattform-URL, optionaler Admin-Zugang, Liefertage und Verhalten (Seed, Parallelität, Änderungen, Stornos) sowie die Prüfungen. Lauf starten/abbrechen mit Live-Log. „Nur Ergebnisse prüfen“ holt Ergebnisse nach einem späteren Marktschluss ab. |
+| **Energiegemeinschaften** | EGs anlegen und konfigurieren: Zugang, Erzeugung und Verbrauch mit Lastprofil, Preisvorstellung, Grafik des Tagesverlaufs. Buttons: „Automatisch einrichten“, „Registrieren“, „Verbindung testen“. Vorschau der Positionen. |
+| **Szenarien** | Randfälle auswählen und ausführen, Ergebnis je Szenario mit Positionen und Abweichungen. |
+| **Manuell** | Einzelne Requests als gewählte EG, auch freie Requests mit absichtlich kaputtem JSON. Im Demo-Modus: Märkte anlegen und schließen. |
+| **Ergebnis** | Fehler, Warnungen, Checks, Szenarien, Märkte, Latenz je Endpoint. Frühere Berichte, Download als JSON. |
+| **Requests** | Jeder Request mit Body und Antwort, filterbar. API-Keys, Passwörter und Tokens werden ausgeblendet. |
 
-Jede Änderung wird sofort in `egsim-ui.json` gespeichert. Die Datei enthält die Zugangsdaten der EGs und steht in
-`.gitignore`. Die UI lauscht standardmäßig nur auf `127.0.0.1`.
+Änderungen landen sofort in `egsim-ui.json`. Die Datei enthält Zugangsdaten und steht in `.gitignore`.
 
-### Eine neue EG einrichten
+## Ein Lauf
 
-1. Im Tab **Energiegemeinschaften** „+ EG hinzufügen“, Name und E-Mail eintragen.
-2. **Registrieren** → `POST /energy-communities`, die EG hat dann den Status `PENDING`.
-3. Der Admin eurer Plattform schaltet sie frei und übergibt API-Key und Passwort.
-4. Beides eintragen, Anmeldeart wählen, **Verbindung testen** (`GET /me`).
-
-Bestehende EGs: einfach Zugangsdaten eintragen. Für die Tests zur Mandantentrennung braucht es mindestens zwei
-aktive EGs.
-
-## Was ein Lauf macht
-
-1. Alle aktiven EGs melden sich an (`X-API-Key` oder `POST /auth/login` → Bearer-Token).
-2. `GET /markets/{deliveryDate}`: Auflösung (`DAY`/`QUARTER_HOUR`), Preise und `closesAt` lesen.
-3. Ist der Markt offen: Positionen aus den Lastprofilen erzeugen und einreichen, einen Teil ändern und stornieren.
-   Jede Antwort wird gegen das Schema geprüft.
+1. Admin-Zugang prüfen (falls eingetragen), EGs anmelden bzw. automatisch einrichten.
+2. `GET /markets/{deliveryDate}`: Auflösung, Preise und `closesAt` lesen.
+3. Ist der Markt offen: Positionen aus den Lastprofilen einreichen, einen Teil ändern und stornieren.
 4. Negativtests bei offenem Markt.
-5. Optional bis zu N Minuten warten, bis der Betreiber den Markt geschlossen und abgewickelt hat
-   (Status-Abfrage alle 10 s), dann Negativtests bei geschlossenem Markt.
-6. Ist der Markt `SETTLED`: Ergebnisse prüfen (siehe unten).
+5. Markt schließen (mit Admin-Key und Option) oder bis zu N Minuten auf den Betreiber warten.
+6. Negativtests bei geschlossenem Markt, Ergebnisprüfung, Konto- und Admin-Checks.
 7. Bericht in `reports/egsim-<Zeitstempel>.json`.
 
-**Lastprofile**: `solar`, `wind`, `household` (Morgen- und Abendspitze), `business` (8–18 Uhr), `night`
-(Wärmepumpe/E-Auto), `flat`. Im Tagesmarkt reicht jede EG eine Position mit ihrer Tagesmenge ein, im
-15-Minuten-Markt wird die Tagesmenge nach Profil auf die Intervalle verteilt (96, an Umstellungstagen 92/100).
-Hat eine EG Erzeugung und Verbrauch, meldet sie je Intervall den Saldo. Gleicher Seed = gleiche Mengen und Preise.
+**Lastprofile**: `solar`, `wind`, `household`, `business`, `night`, `flat`. Im Tagesmarkt eine Position mit der
+Tagesmenge, im 15-Minuten-Markt nach Profil auf die Viertelstunden verteilt. Hat eine EG Erzeugung und Verbrauch,
+meldet sie den Saldo. Gleicher Seed = gleiche Mengen und Preise.
 
-## Ergebnisprüfung ohne Admin
+## Szenarien (Randfälle)
 
-Jede EG sieht nur ihre eigenen Daten (`/result` darf nur der Admin abrufen). EGSim prüft deshalb aus EG-Sicht:
+Jedes Szenario legt feste Positionen an und kennt das erwartete Ergebnis. Die Erwartungen sind von Hand aus dem
+Vertrag abgeleitet, zusätzlich rechnet EGSim jedes Szenario mit der Referenzlogik nach.
 
-- **Mandantentrennung**: In Positionen, Zuteilungen und Trades tauchen keine fremden Datensätze auf.
-- **Positionen**: Nach dem Settlement `PROCESSED` bzw. `CANCELLED`, Mengen unverändert.
-- **Zuteilungen**: Genau eine je Position, auch mit 0 kWh. `requestedKwh` stimmt, Zuteilung liegt zwischen 0 und Anfrage.
-  `reason` passt zu Menge und Typ, z. B. `PRICE_NOT_MET` genau dann, wenn die Preisvorstellung über dem Ankaufspreis liegt.
-- **Trades**: Richtung passt zum Typ, Preis = Ankaufs- bzw. Verkaufspreis des Markts. Die Trade-Mengen ergeben die
-  Zuteilung, `amountEur` = kaufmännisch gerundete Menge × Preis, keine 0-kWh-Trades.
-- **Konsistenz über alle simulierten EGs**: Teilzuteilung pro rata mit gleichem Anteil. Keine Reserve, wenn Angebote
-  gekürzt wurden. Kein Kürzen, wenn Reserve genutzt wurde.
+| ID | Szenario | Erwartung |
+|---|---|---|
+| SZ-01 | Angebot = Bedarf | beide voll, keine Reserve |
+| SZ-02 | Preisvorstellung = Ankaufspreis | noch handelbar |
+| SZ-03 | Preisvorstellung 0,00001 € über Ankaufspreis | `PRICE_NOT_MET`, Bedarf aus der Reserve |
+| SZ-04 | 3 × 5 kWh Angebot, 10 kWh Bedarf | 3,334 / 3,333 / 3,333, Rest an das zuerst eingereichte Angebot |
+| SZ-05 | 100 + 60 kWh Angebot, 120 kWh Bedarf | 75 / 45 kWh |
+| SZ-06 | nur Bedarf | volle Reserve (oder `RESERVE_SHORTAGE`) |
+| SZ-07 | nur Angebot | `NOT_NEEDED`, kein Trade |
+| SZ-08 | 0,001 kWh | Trade über 0,001 kWh, Betrag gerundet |
+| SZ-09 | 1.000.000 kWh | große Beträge ohne Rundungsfehler |
+| SZ-10 | 0,125 kWh | Beträge kaufmännisch gerundet |
+| SZ-11 | Ändern und Stornieren | zählt der letzte Stand, Storno ohne Zuteilung |
+| SZ-12 | EG nach dem Einreichen gesperrt (Admin) | Position `REJECTED` |
+| SZ-20 | jede Viertelstunde des Tages | 96 bzw. 92/100 an Umstellungstagen angenommen |
+| SZ-21 | Lasttest | alle EGs gleichzeitig, keine Serverfehler, Latenz p95 |
 
-**Option „Nur simulierte EGs am Markt“**: Sind auf einem Testmarkt nur EGSim-EGs aktiv, kennt EGSim alle Positionen
-und rechnet das komplette Matching mit der Referenzlogik nach: Teilzuteilung, Rundungsrest, Reserve-Aufteilung und Beträge.
-Als gelieferte Reserve dient die Summe der Reserve-Trades.
+Im **15-Minuten-Markt** bekommt jedes Szenario eine eigene Viertelstunde ab 10:00 Uhr Wiener Zeit, alle laufen auf
+einem Markt. Der Lasttest nutzt 14:00–18:00 Uhr. Im **Tagesmarkt** braucht jedes Szenario einen eigenen Liefertag.
+Die genutzten Viertelstunden sollten leer sein, am besten einen eigenen Testmarkt nehmen (Feld „Liefertage für
+Szenarien“). Mit Admin-Key legt EGSim fehlende Szenario-EGs selbst an. Ohne Admin-Key braucht es so viele EGs mit
+Zugangsdaten, wie die UI anzeigt (maximal vier).
+
+Nicht vom Simulator auslösbar ist alles, was eure Plattform entscheidet: Reserve reicht nicht (Kraftwerk),
+Settlement schlägt fehl (`FAILED`), Token läuft nach einer Stunde ab. Das testet ihr mit Testeinstellungen in der
+Plattform. EGSim prüft dann, ob Zuteilungen und Trades dazu passen.
+
+## Ergebnisprüfung
+
+- **Immer (EG-Sicht):** Mandantentrennung, Positionsstatus nach dem Settlement, genau eine Zuteilung je Position,
+  `reason` passend zu Menge, Typ und Preisvorstellung. Trades passend zur Zuteilung, Preise, Beträge (kaufmännisch gerundet).
+  Teilzuteilung pro rata über alle simulierten EGs.
+- **Mit Admin-Key:** Alle Positionen des Markts werden komplett nachgerechnet und mit `/allocations`, `/trades` und
+  dem Tagesergebnis `/result` verglichen, inklusive Reserve und Marge, bei 15 Minuten auch je Intervall.
+- **Ohne Admin, „Nur simulierte EGs am Markt“:** Komplette Nachrechnung aus den Daten der simulierten EGs.
 
 ## Negativtests
 
 | Gruppe | Beispiele |
 |---|---|
-| `AUTH` | ohne/mit ungültigem API-Key oder Token → 401; Login mit falschem Passwort; Logout macht das Token ungültig |
-| `ROLE` | EG listet alle EGs, ruft Tagesergebnis ab, ändert eigenen Status, vergibt sich Zugangsdaten → 403 |
-| `TEN` | fremde Position abrufen/ändern/stornieren, fremde `energyCommunityId`, fremde Filter, fremdes Profil → 403 |
-| `VAL`, `INT` | Mengen/Preise (Grenzen, Nachkommastellen, Typ), `type`, Datumsformat, unbekannte/fehlende Felder, kaputtes JSON, `intervalStart`-Regeln |
-| `NF`, `STATE`, `POS`, `PROF` | 404- und 400-Codes, `POSITION_ALREADY_EXISTS`, `MARKET_NOT_SETTLED`, `POSITION_NOT_MODIFIABLE`, Profiländerung |
-| `CLOSED` | nach Marktschluss: Einreichen/Ändern/Stornieren → 409, EG schließt Markt → 403, Position `PROCESSED` |
-| `REG` (optional) | Registrierung mit ungültigen Daten → 400, doppelte E-Mail → 409. Legt eine PENDING-Test-EG an, deshalb standardmäßig aus. |
+| `AUTH` | fehlende/ungültige Zugangsdaten → 401, falsches Passwort, Logout macht Token ungültig |
+| `ROLE` | EG listet alle EGs, ruft Tagesergebnis ab, ändert Status, vergibt sich Zugangsdaten → 403 |
+| `TEN` | fremde Positionen abrufen/ändern/stornieren, fremde IDs und Filter → 403 |
+| `VAL`, `INT` | Grenzen und Nachkommastellen, Typen, Datumsformat, unbekannte Felder, kaputtes JSON, `intervalStart` |
+| `NF`, `STATE`, `POS`, `PROF` | 400/404-Codes, doppelte Position, `MARKET_NOT_SETTLED`, `POSITION_NOT_MODIFIABLE` |
+| `CLOSED` | nach Marktschluss: Einreichen/Ändern/Stornieren → 409, Position `PROCESSED` |
+| `ADM` (Admin) | Statusübergänge, PENDING/gesperrte EG → 403, neue Zugangsdaten machen alte ungültig, Löschen (204/409), Markt-Schließen idempotent |
+| `REG` (optional) | Registrierung mit ungültigen Daten → 400, doppelte E-Mail → 409 |
 
-Validierungstests laufen mit einer EG, die im selben Intervall schon eine Position hat. Ein Server, der die
-Validierung auslässt, antwortet dann mit 409, statt eine falsche Position anzulegen. Wird trotzdem eine
-ungültige Position angelegt, storniert EGSim sie wieder und meldet das.
+## Hosten
+
+**Lokal:** `egsim ui` läuft auf `127.0.0.1:8090`. Die Plattform lokal starten und `http://localhost:<port>` eintragen.
+
+**VPS mit Docker Compose** (Simulator und Plattform auf demselben Server):
+
+```bash
+cp deploy/.env.example .env      # UI-Passwort und Domain eintragen
+docker compose up -d --build
+```
+
+- Caddy stellt die UI per HTTPS unter `EGSIM_DOMAIN` bereit (Let's Encrypt, die Domain muss auf den VPS zeigen).
+- Die UI verlangt ein Passwort (Benutzer `egsim`, Passwort aus `EGSIM_UI_PASSWORD`).
+- Eure Plattform als weiteren Service in `docker-compose.yml` eintragen (Vorlage ist drin). EGSim erreicht sie
+  intern unter `http://plattform:8080`, die Plattform-API muss dafür nicht öffentlich sein.
+- Ohne Domain: Caddy weglassen und per SSH-Tunnel zugreifen: `ssh -L 8090:localhost:8090 <vps>`.
+
+**Kubernetes:** `deploy/kubernetes/egsim.yaml` enthält Deployment, Service und Volume. Das Image baut GitHub Actions
+bei jedem Push nach `ghcr.io/renshredder/egsim`. Das UI-Passwort kommt aus einem Secret, als Basis-URL tragt ihr den
+Service der Plattform im Cluster ein.
+
+Ohne Docker: Mit `EGSIM_UI_PASSWORD=… egsim ui --host 0.0.0.0` ist die UI auch direkt passwortgeschützt.
 
 ## Ohne UI (z. B. CI)
 
 ```bash
-egsim run -c egsim-ui.json                  # Lauf mit der gespeicherten UI-Konfiguration
-egsim run -c egsim-ui.json --wait 30        # bis zu 30 min auf das Settlement warten
-egsim run -c egsim-ui.json --verify-only    # nur Ergebnisse prüfen
-egsim plan -c egsim-ui.json --resolution QUARTER_HOUR
-egsim mock --demo-egs 3 --auto-settle       # Mock als eigenen Server (Port 8080)
+egsim run -c egsim-ui.json                     # Lauf mit der gespeicherten UI-Konfiguration
+egsim run -c egsim-ui.json --close             # Markt per Admin-Key selbst schließen
+egsim run -c egsim-ui.json --scenarios         # ausgewählte Szenarien (oder --scenarios SZ-01,SZ-04)
+egsim run -c egsim-ui.json --wait 30           # bis zu 30 min auf das Settlement warten
+egsim run -c egsim-ui.json --verify-only       # nur Ergebnisse prüfen
+egsim mock --demo-egs 3 --auto-settle          # Mock als eigenen Server (Port 8080, Admin-Key admin-key)
 ```
 
-Exit-Code `0` = alles vertragskonform, `1` = Befunde, `2` = Konfigurationsfehler. Werte wie `${EG_API_KEY}` in der
-JSON-Datei werden aus Umgebungsvariablen gelesen. So müssen in CI keine Secrets in der Datei stehen.
+Exit-Code `0` = alles vertragskonform, `1` = Befunde, `2` = Konfigurationsfehler. `${VAR}` in der JSON-Datei wird
+aus Umgebungsvariablen gelesen, so müssen keine Secrets in der Datei stehen.
 
 ## Annahmen zum Datenvertrag (bitte abstimmen)
 
-1. **Markt anlegen**: Dafür gibt es keinen Endpoint. EGSim setzt voraus, dass der Markt existiert.
-2. **Liefertag in der Vergangenheit ohne Markt**: Laut Prüfreihenfolge 404 vor 422. `VAL-13` akzeptiert beides und
-   vermerkt 404 als Hinweis.
-3. **Fremde vs. unbekannte EG-ID**: Nach der Prüfreihenfolge 404 für eine unbekannte und 403 für eine fremde EG (`NF-02`, `TEN-07`).
-4. **`PUT /positions/{id}` ohne Preisvorstellung**: Ob die Preisvorstellung dann entfernt oder behalten wird, ist offen.
-   EGSim schickt sie beim Ändern immer mit.
-5. **Rundungsrest** (vollständige Nachrechnung): Er wird in 0,001-kWh-Schritten nach `createdAt` an alle beteiligten
-   Positionen verteilt, nicht nur an die, die beim Abrunden etwas verloren haben.
-6. **Reserveanteil im Trade**: pro rata von der gelieferten Reserve, Anteil aus Angeboten = Zuteilung − Reserveanteil.
-   Abweichungen um 0,001 kWh fängt die einstellbare Toleranz ab.
-7. **Logout**: Laut Vertrag nur mit Bearer-Token. EGSim testet Logout nur so.
-8. **`createdAt` nach PUT**: Sollte unverändert bleiben, weil es die Rundungsreihenfolge bestimmt (EGSim warnt sonst).
+1. **Markt anlegen:** Dafür gibt es keinen Endpoint. EGSim setzt voraus, dass der Markt existiert.
+2. **Liefertag in der Vergangenheit ohne Markt:** Laut Prüfreihenfolge 404 vor 422. `VAL-13` akzeptiert beides.
+3. **Unbekannte vs. fremde EG-ID:** 404 für unbekannt, 403 für fremd (Prüfreihenfolge).
+4. **`PUT /positions/{id}` ohne Preisvorstellung:** Ob sie entfernt oder behalten wird, ist offen. EGSim schickt sie immer mit.
+5. **Rundungsrest:** Er geht in 0,001-kWh-Schritten nach `createdAt` an alle beteiligten Positionen (SZ-04).
+6. **Reserveanteil im Trade:** pro rata von der gelieferten Reserve, Anteil aus Angeboten = Zuteilung − Reserveanteil.
+7. **Stornierte Position:** Sie blockiert den Slot nicht für eine neue Position (SZ-20, SZ-21).
+8. **Zugangsdaten für PENDING-EGs:** Die Vergabe ist erlaubt, eine Anmeldung damit ergibt 403 (`ADM-07` bis `ADM-09`).
+9. **`createdAt` nach PUT:** Es bleibt unverändert, weil es die Rundungsreihenfolge bestimmt.
 
 ## Projektstruktur
 
 ```
 egsim/
-  ui/server.py, ui/static/index.html   Web-UI (nur Standardbibliothek + Vanilla-JS)
-  config.py       Konfiguration (JSON), Validierung
-  simulator.py    Ablauf aus EG-Sicht: Anmelden, Einreichen, Ändern, Stornieren, Warten, Prüfen
-  checks.py       Negativ- und Vertragstests
-  verify.py       Ergebnisprüfung aus EG-Sicht, optional vollständige Nachrechnung
+  ui/server.py, ui/static/index.html   Web-UI (Standardbibliothek + Vanilla-JS), optional Basic Auth
+  simulator.py    Ablauf: Anmelden/Einrichten, Einreichen, Ändern, Stornieren, Schließen/Warten, Prüfen
+  scenarios.py    Szenario-Katalog
+  checks.py       Negativ-, Konto- und Admin-Checks
+  verify.py       Ergebnisprüfung (EG-Sicht, vollständig, Admin inkl. /result)
   settlement.py   Referenzrechnung der Handels- und Preislogik (Decimal)
   profiles.py     Lastprofile → Positionen
+  config.py       Konfiguration (JSON)
   client.py       HTTP-Client, Request-Log
-  mockserver.py   In-Memory-Mock der API (nur für Demo und Tests)
-tests/            pytest: Vertragsbeispiele, Profile/Config, Ende-zu-Ende gegen Mock inkl. UI-API und fehlerhafter Plattform
+  mockserver.py   In-Memory-Mock der API
+deploy/           Caddyfile, .env-Vorlage, Kubernetes-Manifest
+tests/            pytest: Vertragsbeispiele, Profile/Config, Ende-zu-Ende gegen Mock inkl. Szenarien und fehlerhafter Plattformen
 ```
 
-Der Mock rechnet mit derselben Referenzlogik wie die Prüfung. Gegen den Mock zeigt ein „OK“ also nur, dass der
-Ablauf funktioniert. Die Richtigkeit der Logik sichern die Unit-Tests mit den Beispielen aus dem Vertrag
-(`tests/test_settlement.py`).
+Gegen den Mock zeigt ein „OK“ nur, dass der Ablauf funktioniert, denn Mock und Prüfung nutzen dieselbe
+Referenzlogik. Die Logik selbst sichern die Unit-Tests mit den Beispielen aus dem Vertrag und die handgeschriebenen
+Szenario-Erwartungen ab.
 
 ```bash
 pytest -q

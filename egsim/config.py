@@ -100,6 +100,15 @@ class Config:
     base_url: str = "http://localhost:8080"
     timeout: float = 10.0
     verify_tls: bool = True
+    # optional: Admin-Zugang der Test-Plattform (nur für Testsysteme)
+    admin_api_key: str | None = None
+    admin_email: str | None = None
+    admin_password: str | None = None
+    auto_provision: bool = True
+    close_market: bool = False
+    admin_checks: bool = True
+    scenarios: list[str] = field(default_factory=list)
+    scenario_dates: list[str] = field(default_factory=list)
 
     seed: int | None = None
     delivery_dates: list[str] = field(default_factory=lambda: ["tomorrow"])
@@ -125,19 +134,25 @@ class Config:
     communities: list[CommunityConfig] = field(default_factory=list)
 
     @property
+    def has_admin(self) -> bool:
+        return bool(self.admin_api_key or (self.admin_email and self.admin_password))
+
+    @property
     def active_communities(self) -> list[CommunityConfig]:
         return [c for c in self.communities if c.enabled]
 
 
 def default_config_dict() -> dict:
     return {
-        "platform": {"baseUrl": "http://localhost:8080", "timeoutSeconds": 10, "verifyTls": True},
+        "platform": {"baseUrl": "http://localhost:8080", "timeoutSeconds": 10, "verifyTls": True,
+                     "adminApiKey": "", "adminEmail": "", "adminPassword": ""},
         "run": {
             "seed": 42, "deliveryDates": ["tomorrow"], "concurrency": 4, "delayMs": [0, 0],
             "submitPositions": True, "waitForSettlementMinutes": 0, "verifyResults": True,
             "allParticipantsSimulated": False, "checks": True, "registrationChecks": False,
             "onExistingPosition": "skip", "reportDir": "reports", "failOnFindings": True,
-            "tolerance": {"kwh": 0, "eur": 0},
+            "tolerance": {"kwh": 0, "eur": 0}, "autoProvision": True, "closeMarket": False, "adminChecks": True,
+            "scenarios": [], "scenarioDates": [],
         },
         "behaviour": {"updateProbability": 0.2, "updateChangePercent": 20, "cancelProbability": 0.05,
                       "quarterHour": {"intervals": "all"}},
@@ -202,8 +217,6 @@ def _community(raw: dict, i: int) -> CommunityConfig:
         consumption=_flow(raw.get("consumption"), f"{where} Verbrauch"),
         price_expectation=pe,
     )
-    if c.enabled and not c.generation and not c.consumption:
-        raise ConfigError(f"{where}: Erzeugung und/oder Verbrauch angeben")
     return c
 
 
@@ -216,6 +229,9 @@ def parse_config(raw: dict) -> Config:
         raise ConfigError("Plattform-URL muss mit http:// oder https:// beginnen")
     cfg.timeout = float(plat.get("timeoutSeconds", cfg.timeout))
     cfg.verify_tls = bool(plat.get("verifyTls", cfg.verify_tls))
+    cfg.admin_api_key = plat.get("adminApiKey") or None
+    cfg.admin_email = plat.get("adminEmail") or None
+    cfg.admin_password = plat.get("adminPassword") or None
 
     run = raw.get("run") or {}
     seed = run.get("seed")
@@ -244,6 +260,17 @@ def parse_config(raw: dict) -> Config:
         raise ConfigError("Bestehende Position: skip oder update")
     cfg.report_dir = run.get("reportDir", cfg.report_dir) or None
     cfg.fail_on_findings = bool(run.get("failOnFindings", cfg.fail_on_findings))
+    cfg.auto_provision = bool(run.get("autoProvision", cfg.auto_provision))
+    cfg.close_market = bool(run.get("closeMarket", cfg.close_market))
+    cfg.admin_checks = bool(run.get("adminChecks", cfg.admin_checks))
+    cfg.scenarios = [str(x) for x in (run.get("scenarios") or [])]
+    sd = run.get("scenarioDates") or []
+    cfg.scenario_dates = [str(x).strip() for x in (sd if isinstance(sd, list) else [sd]) if str(x).strip()]
+    for x in cfg.scenario_dates:
+        try:
+            resolve_delivery_date(x)
+        except ValueError as exc:
+            raise ConfigError(f"Szenarien: {exc}")
     tol = run.get("tolerance") or {}
     cfg.tolerance_kwh = Decimal(str(tol.get("kwh") or 0))
     cfg.tolerance_eur = Decimal(str(tol.get("eur") or 0))

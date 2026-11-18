@@ -101,9 +101,12 @@ class Simulator:
         self.run_id = now_utc().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:4]
         self.seed = cfg.seed if cfg.seed is not None else random.randrange(1_000_000)
         self.base = ApiClient(cfg.base_url, stats=self.stats, timeout=cfg.timeout, verify_tls=cfg.verify_tls, label="anonym")
+        self.admin: ApiClient | None = None
         self.egs: list[SimEG] = []
         self.markets: list[MarketRun] = []
         self.check_results: list[dict] = []
+        self.scenario_results: list[dict] = []
+        self.provisioned: list[str] = []
         self.started_at = now_utc()
         self.mode = "run"
         self.stopped = False
@@ -150,24 +153,106 @@ class Simulator:
         ready = sum(1 for e in self.egs if e.ready)
         log.info("%d/%d EGs angemeldet", ready, len(self.egs))
         if not self.egs:
-            self.findings.error("setup", "Keine aktive EG konfiguriert")
+            if self._can_provision() and self.mode == "scenarios":
+                log.info("Keine EG konfiguriert – Szenario-EGs werden automatisch angelegt")
+            else:
+                self.findings.error("setup", "Keine aktive EG konfiguriert")
         elif ready == 0:
             self.findings.error("setup", "Keine EG konnte sich anmelden – Zugangsdaten prüfen")
 
+    # ---------------------------------------------------------------- Admin
+    def setup_admin(self) -> None:
+        """Optionaler Admin-Zugang der Test-Plattform: EGs automatisch einrichten, Markt schließen, Admin-Checks."""
+        if not self.cfg.has_admin:
+            return
+        if self.cfg.admin_api_key:
+            client = self.base.with_auth(api_key=self.cfg.admin_api_key, label="admin")
+        else:
+            r = self.base.login(self.cfg.admin_email, self.cfg.admin_password)
+            if r.status != 200 or not isinstance(r.body, dict) or not r.body.get("token"):
+                self.findings.error("admin", f"Admin-Login fehlgeschlagen ({r.status} {r.code or ''})", r.short())
+                return
+            client = self.base.with_auth(token=r.body["token"], label="admin")
+        me = client.me()
+        if me.status != 200 or not isinstance(me.body, dict) or me.body.get("role") != "ADMIN":
+            self.findings.error("admin", f"Admin-Zugang ungültig: GET /me liefert {me.status} "
+                                         f"{(me.body or {}).get('role') if isinstance(me.body, dict) else ''}", me.short())
+            return
+        self.admin = client
+        log.info("Admin-Zugang ok – EGs werden bei Bedarf automatisch eingerichtet")
+
+    def _can_provision(self) -> bool:
+        return self.admin is not None and self.cfg.auto_provision
+
+    def provision(self, eg: SimEG) -> bool:
+        """EG über die API anlegen bzw. reparieren: registrieren, freischalten, Zugangsdaten holen."""
+        c, adm = eg.cfg, self.admin
+        if c.energy_community_id:
+            g = adm.get_community(c.energy_community_id)
+            if g.status == 404:
+                log.info("[%s] EG-ID %s existiert nicht mehr – registriere neu", eg.key, c.energy_community_id)
+                c.energy_community_id = None
+            elif g.status != 200:
+                self.findings.error("setup", f"[{eg.key}] Admin: EG abrufen fehlgeschlagen", g.short())
+                return False
+            else:
+                c.email = c.email or (g.body or {}).get("email")
+        if not c.energy_community_id:
+            email = c.email or f"egsim-{re.sub('[^a-z0-9]+', '-', eg.key.lower()).strip('-')}-{uuid.uuid4().hex[:6]}@egsim.example"
+            r = self.base.register(email, eg.key[:120], c.description or "Simulierte EG (EGSim)")
+            if r.status == 201 and isinstance(r.body, dict) and r.body.get("id"):
+                c.energy_community_id, c.email = r.body["id"], email
+            elif r.status == 409 and r.code == "EMAIL_ALREADY_REGISTERED":
+                lst = adm.list_communities()
+                match = next((x for x in (lst.body or []) if isinstance(x, dict)
+                              and str(x.get("email", "")).lower() == email.lower()), None) if lst.status == 200 else None
+                if not match:
+                    self.findings.error("setup", f"[{eg.key}] E-Mail {email} ist vergeben, EG aber nicht auffindbar", r.short())
+                    return False
+                c.energy_community_id, c.email = match["id"], email
+            else:
+                self.findings.error("setup", f"[{eg.key}] automatische Registrierung fehlgeschlagen", r.short())
+                return False
+        st = adm.set_status(c.energy_community_id, "ACTIVE")
+        if st.status != 200:
+            self.findings.error("setup", f"[{eg.key}] Freischalten fehlgeschlagen", st.short())
+            return False
+        cr = adm.issue_credentials(c.energy_community_id)
+        if cr.status != 201 or not isinstance(cr.body, dict) or not cr.body.get("apiKey"):
+            self.findings.error("setup", f"[{eg.key}] Zugangsdaten vergeben fehlgeschlagen", cr.short())
+            return False
+        c.api_key, c.password = cr.body["apiKey"], cr.body.get("password")
+        with self._lock:
+            self.provisioned.append(c.uid)
+        log.info("[%s] automatisch eingerichtet (EG %s)", eg.key, c.energy_community_id)
+        return True
+
     def _connect_one(self, eg: SimEG) -> None:
         c = eg.cfg
+        if c.has_credentials and self._try_connect(eg, quiet=self._can_provision()):
+            return
+        if self._can_provision():
+            eg.problem = None
+            if self.provision(eg):
+                self._try_connect(eg, quiet=False)
+            elif not eg.problem:
+                eg.problem = "automatische Einrichtung fehlgeschlagen"
+            return
         if not c.has_credentials:
             eg.problem = "keine Zugangsdaten"
             self.findings.warning("setup", f"[{eg.key}] keine Zugangsdaten hinterlegt – EG wird übersprungen. "
-                                           "Nach der Registrierung schaltet der Admin der Plattform die EG frei und "
-                                           "übergibt API-Key und Passwort.")
-            return
+                                           "Admin-Key der Test-Plattform eintragen (automatische Einrichtung) oder "
+                                           "API-Key/Passwort der EG eintragen.")
+
+    def _try_connect(self, eg: SimEG, quiet: bool) -> bool:
+        c = eg.cfg
         if c.auth == "bearer":
             r = self.base.login(c.email, c.password)
             if r.status != 200 or not isinstance(r.body, dict) or not r.body.get("token"):
                 eg.problem = f"Login {r.status} {r.code or ''}".strip()
-                self._login_problem(eg, r)
-                return
+                if not quiet:
+                    self._login_problem(eg, r)
+                return False
             if r.body.get("tokenType") != "Bearer" or r.body.get("role") != "ENERGY_COMMUNITY":
                 self.findings.error("response", f"[{eg.key}] Login-Antwort: tokenType={r.body.get('tokenType')}, "
                                                 f"role={r.body.get('role')}", r.short())
@@ -177,22 +262,25 @@ class Simulator:
         me = client.me()
         if me.status != 200:
             eg.problem = f"GET /me {me.status} {me.code or ''}".strip()
-            self._login_problem(eg, me)
-            return
+            if not quiet:
+                self._login_problem(eg, me)
+            return False
         body = me.body or {}
         ec = body.get("energyCommunity") or {}
         if body.get("role") != "ENERGY_COMMUNITY" or not ec.get("id"):
             eg.problem = f"role={body.get('role')}"
             self.findings.error("setup", f"[{eg.key}] GET /me liefert role={body.get('role')} ohne energyCommunity – "
-                                         "der Simulator braucht EG-Zugangsdaten, keinen Admin-Key", me.short())
-            return
+                                         "hier gehören EG-Zugangsdaten hin, kein Admin-Key", me.short())
+            return False
         if c.energy_community_id and ec["id"] != c.energy_community_id:
             self.findings.warning("setup", f"[{eg.key}] Zugangsdaten gehören zu EG {ec['id']}, eingetragen ist "
                                            f"{c.energy_community_id}", me.short())
         if ec.get("status") != "ACTIVE":
             self.findings.error("response", f"[{eg.key}] GET /me liefert Status {ec.get('status')} statt 403 "
                                             "für eine nicht aktive EG", me.short())
-        eg.id, eg.status, eg.client = ec["id"], ec.get("status"), client
+        c.energy_community_id = ec["id"]
+        eg.id, eg.status, eg.client, eg.problem = ec["id"], ec.get("status"), client, None
+        return True
 
     def _login_problem(self, eg: SimEG, r: ApiResponse) -> None:
         if r.code == "ENERGY_COMMUNITY_NOT_ACTIVE":
@@ -242,12 +330,7 @@ class Simulator:
             self._check_stop()
             self.check_results += checks.run_open_market_checks(self, run)
 
-        run.final_status = m.get("status")
-        if self.cfg.wait_for_settlement_minutes > 0 and run.final_status != "SETTLED":
-            self._wait_for_settlement(run, reader)
-        else:
-            cur = reader.get_market(delivery)
-            run.final_status = (cur.body or {}).get("status") if cur.status == 200 else run.final_status
+        self._finish_market(run, reader)
 
         if run.final_status in ("CLOSED", "SETTLED", "FAILED") and self.cfg.checks:
             self.check_results += checks.run_closed_market_checks(self, run)
@@ -273,6 +356,41 @@ class Simulator:
             problems.append("closesAt fehlt")
         if problems:
             self.findings.error("response", f"Markt {delivery} weicht vom Schema ab: " + "; ".join(problems), r.short())
+
+    def _finish_market(self, run: MarketRun, reader: ApiClient) -> None:
+        """Markt schließen (nur mit Admin-Key und Option) oder auf den Betreiber warten oder nur Status lesen."""
+        run.final_status = (run.market or {}).get("status")
+        if self.cfg.close_market and self.admin and run.final_status in ("OPEN", "FAILED"):
+            self._close(run)
+        elif self.cfg.wait_for_settlement_minutes > 0 and run.final_status != "SETTLED":
+            self._wait_for_settlement(run, reader)
+        else:
+            cur = reader.get_market(run.delivery_date)
+            run.final_status = (cur.body or {}).get("status") if cur.status == 200 else run.final_status
+
+    def _close(self, run: MarketRun) -> None:
+        r = self.admin.close_market(run.delivery_date)
+        if not self._expect(r, (200, 202), "close", f"Admin: Markt {run.delivery_date} schließen"):
+            return
+        status = (r.body or {}).get("status")
+        if r.status == 200 and status != "SETTLED":
+            self.findings.error("close", f"close antwortet 200, Status aber {status} (erwartet SETTLED)", r.short())
+        if r.status == 202 and status != "CLOSED":
+            self.findings.error("close", f"close antwortet 202, Status aber {status} (erwartet CLOSED)", r.short())
+        deadline = time.monotonic() + max(60.0, self.cfg.wait_for_settlement_minutes * 60)
+        while status not in ("SETTLED", "FAILED") and time.monotonic() < deadline:
+            if self.stop.wait(1):
+                raise Stopped()
+            g = self.admin.get_market(run.delivery_date)
+            status = (g.body or {}).get("status") if g.status == 200 else status
+        run.final_status = status
+        if status == "FAILED":
+            g = self.admin.get_market(run.delivery_date)
+            self.findings.error("close", f"Settlement FAILED: {(g.body or {}).get('failureReason')}", g.short())
+        elif status != "SETTLED":
+            self.findings.error("close", f"Settlement nicht abgeschlossen (Status {status})")
+        else:
+            log.info("Markt %s geschlossen und abgewickelt", run.delivery_date)
 
     def _wait_for_settlement(self, run: MarketRun, reader: ApiClient) -> None:
         deadline = time.monotonic() + self.cfg.wait_for_settlement_minutes * 60
@@ -453,6 +571,7 @@ class Simulator:
             h = self.base.health_ready()
             if h.status != 200:
                 self.findings.warning("health", f"/health/ready liefert {h.status or h.error}", h.short())
+            self.setup_admin()
             self.connect()
             for d in self._dates():
                 self._check_stop()
@@ -461,6 +580,8 @@ class Simulator:
                 from egsim import checks
                 self._check_stop()
                 self.check_results += checks.run_account_checks(self)
+                if self.admin and self.cfg.admin_checks:
+                    self.check_results += checks.run_admin_checks(self)
         except Stopped:
             self.stopped = True
             self.findings.warning("run", "Lauf wurde abgebrochen")
@@ -471,6 +592,7 @@ class Simulator:
         self.mode = "verify"
         from egsim.verify import verify_market
         try:
+            self.setup_admin()
             self.connect()
             reader = self.reader()
             for d in self._dates():
@@ -493,6 +615,22 @@ class Simulator:
             self.stopped = True
         return self.report()
 
+    def run_scenarios(self) -> dict:
+        """Gezielte Randfälle aus dem Szenario-Katalog (siehe egsim/scenarios.py)."""
+        self.mode = "scenarios"
+        from egsim.scenarios import run_scenarios
+        try:
+            h = self.base.health_ready()
+            if h.status != 200:
+                self.findings.warning("health", f"/health/ready liefert {h.status or h.error}", h.short())
+            self.setup_admin()
+            self.connect()
+            run_scenarios(self)
+        except Stopped:
+            self.stopped = True
+            self.findings.warning("run", "Lauf wurde abgebrochen")
+        return self.report()
+
     def report(self) -> dict:
         summary = self.stats.summary()
         return {
@@ -509,6 +647,9 @@ class Simulator:
                             for e in self.egs],
             "markets": [m.summary() for m in self.markets],
             "checks": self.check_results,
+            "scenarios": sorted(self.scenario_results, key=lambda x: x["id"]),
+            "admin": self.admin is not None,
+            "provisioned": [c.name for c in self.cfg.communities if c.uid in self.provisioned],
             "findings": self.findings.as_list(),
             "requests": summary,
             "totals": {
@@ -517,6 +658,8 @@ class Simulator:
                 "checksPassed": sum(1 for c in self.check_results if c["result"] == "PASS"),
                 "checksFailed": sum(1 for c in self.check_results if c["result"] == "FAIL"),
                 "checksSkipped": sum(1 for c in self.check_results if c["result"] == "SKIP"),
+                "scenariosPassed": sum(1 for x in self.scenario_results if x["result"] == "PASS"),
+                "scenariosFailed": sum(1 for x in self.scenario_results if x["result"] == "FAIL"),
                 "requests": sum(x["requests"] for x in summary),
             },
         }

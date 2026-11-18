@@ -46,9 +46,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         cfg.seed = args.seed
     if args.wait is not None:
         cfg.wait_for_settlement_minutes = args.wait
+    if args.close:
+        cfg.close_market = True
 
     sim = Simulator(cfg)
-    report = sim.verify_only() if args.verify_only else sim.run()
+    if args.scenarios is not None:
+        if args.scenarios:
+            cfg.scenarios = [x.strip() for x in args.scenarios.split(",") if x.strip()]
+        report = sim.run_scenarios()
+    else:
+        report = sim.verify_only() if args.verify_only else sim.run()
     path = write_report(report, str(Path(cfg.report_dir) / "egsim-{timestamp}.json") if cfg.report_dir else None)
     print(format_summary(report))
     if path:
@@ -111,6 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--seed", type=int)
     r.add_argument("--wait", type=float, help="Minuten auf Settlement warten")
     r.add_argument("--verify-only", action="store_true", help="nur Ergebnisse prüfen")
+    r.add_argument("--scenarios", nargs="?", const="", help="Szenarien ausführen (ohne Wert: Auswahl aus der Konfiguration, "
+                                                             "sonst z. B. SZ-01,SZ-04)")
+    r.add_argument("--close", action="store_true", help="Markt per Admin-Key selbst schließen")
     r.set_defaults(func=cmd_run)
 
     pl = sub.add_parser("plan", help="geplante Positionen anzeigen (ohne Plattform)")

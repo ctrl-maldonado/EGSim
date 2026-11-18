@@ -73,6 +73,7 @@
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
   td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+  td.mono { white-space: nowrap; }
   tr.click { cursor: pointer; } tr.click:hover td { background: #f7f9f6; }
   tr.sel td { background: var(--accent-soft); }
   .scroll { max-height: 520px; overflow: auto; }
@@ -94,6 +95,7 @@
   <nav id="nav">
     <button data-tab="run" class="active">Lauf</button>
     <button data-tab="egs">Energiegemeinschaften</button>
+    <button data-tab="scenarios">Szenarien</button>
     <button data-tab="manual">Manuell</button>
     <button data-tab="result">Ergebnis</button>
     <button data-tab="requests">Requests</button>
@@ -116,12 +118,22 @@
         <label class="f"><span>Timeout (s)</span><input type="number" min="1" data-path="platform.timeoutSeconds" data-type="num"></label>
         <label class="f"><span>TLS-Zertifikat prüfen</span><input type="checkbox" data-path="platform.verifyTls" data-type="bool"></label>
 
+        <h2 style="margin-top:20px">Admin-Zugang der Test-Plattform (optional)</h2>
+        <label class="f"><span>Admin-API-Key</span><div><input type="password" autocomplete="off" data-path="platform.adminApiKey" placeholder="leer = ohne Admin"><small>Nur für eure eigene Test-Plattform. Damit legt EGSim die EGs selbst an, schaltet sie frei und holt die Zugangsdaten.</small></div></label>
+        <details><summary>stattdessen Admin-Login mit E-Mail und Passwort</summary>
+          <label class="f"><span>Admin-E-Mail</span><input data-path="platform.adminEmail"></label>
+          <label class="f"><span>Admin-Passwort</span><input type="password" autocomplete="off" data-path="platform.adminPassword"></label>
+        </details>
+        <label class="f"><span>EGs automatisch einrichten</span><div><input type="checkbox" data-path="run.autoProvision" data-type="bool"> <small>fehlende oder ungültige Zugangsdaten selbst besorgen</small></div></label>
+        <label class="f"><span>Markt selbst schließen</span><div><input type="checkbox" data-path="run.closeMarket" data-type="bool"> <small>nach dem Einreichen, nur auf Testsystemen</small></div></label>
+        <label class="f"><span>Admin-Checks</span><div><input type="checkbox" data-path="run.adminChecks" data-type="bool"> <small>Statuswechsel, Sperren, Löschen mit einer Wegwerf-EG</small></div></label>
+
         <h2 style="margin-top:20px">Markt &amp; Ablauf</h2>
         <label class="f"><span>Liefertage</span><div><input data-path="run.deliveryDates" data-type="list" placeholder="tomorrow, +2, 2026-11-20"><small>today, tomorrow, +N oder JJJJ-MM-TT, mit Komma getrennt. Der Markt muss existieren.</small></div></label>
         <label class="f"><span>Positionen einreichen</span><input type="checkbox" data-path="run.submitPositions" data-type="bool"></label>
         <label class="f"><span>Bestehende Position</span><select data-path="run.onExistingPosition"><option value="skip">überspringen</option><option value="update">mit neuen Werten aktualisieren</option></select></label>
         <label class="f"><span>Auf Settlement warten</span><div class="row"><input type="number" min="0" step="1" data-path="run.waitForSettlementMinutes" data-type="num"><span class="muted">Minuten</span></div></label>
-        <p class="hint">Der Simulator schließt keine Märkte. Mit Wartezeit fragt er den Marktstatus alle 10 s ab, bis euer Betreiber den Markt geschlossen und abgewickelt hat, und prüft dann die Ergebnisse.</p>
+        <p class="hint">Ohne „Markt selbst schließen“ fragt der Simulator den Marktstatus alle 10 s ab, bis der Markt geschlossen und abgewickelt ist, und prüft dann die Ergebnisse.</p>
       </div>
 
       <div class="panel">
@@ -157,8 +169,9 @@
   <!-- ======================================================= EGs -->
   <section class="tab" id="tab-egs">
     <div class="banner info">
-      Der Simulator hat keinen Admin-Zugang. Ablauf für eine neue EG: E-Mail eintragen → <b>Registrieren</b> (Status PENDING) →
-      der Admin eurer Plattform schaltet sie frei und übergibt API-Key und Passwort → hier eintragen → <b>Verbindung testen</b>.
+      Eure Plattform muss jede EG kennen, die Anfragen schickt (Datenvertrag: API-Key bzw. Login je EG).
+      <b>Mit Admin-Key</b> (Tab „Lauf“) richtet EGSim die EGs beim Start selbst ein – hier reichen Name und Profil.
+      <b>Ohne Admin-Key</b>: Zugangsdaten eintragen oder <b>Registrieren</b> und vom Admin freischalten lassen.
       Für die Tests zur Mandantentrennung braucht es mindestens zwei aktive EGs.
     </div>
     <div class="toolbar">
@@ -170,6 +183,27 @@
     </div>
     <div id="egList"></div>
     <div id="planOut" class="panel" hidden></div>
+  </section>
+
+  <!-- ======================================================= SZENARIEN -->
+  <section class="tab" id="tab-scenarios">
+    <div class="banner info">
+      Szenarien legen gezielt Positionen an und prüfen das erwartete Ergebnis. Im <b>15-Minuten-Markt</b> bekommt jedes
+      Szenario eine eigene Viertelstunde ab 10:00 Uhr, alle laufen auf einem Markt. Im <b>Tagesmarkt</b> braucht jedes Szenario
+      einen eigenen Liefertag. Die Viertelstunden sollten leer sein, also am besten einen eigenen Testmarkt nehmen.
+      Ergebnisse gibt es erst nach dem Settlement: Wartezeit setzen oder mit Admin-Key „Markt selbst schließen“.
+    </div>
+    <div class="panel">
+      <label class="f"><span>Liefertage für Szenarien</span><div><input data-path="run.scenarioDates" data-type="list" placeholder="leer = Liefertage aus „Lauf“"><small>z. B. +2 für einen 15-Minuten-Markt übermorgen</small></div></label>
+      <div class="toolbar" style="margin-top:10px">
+        <label><input type="checkbox" id="scAll"> alle</label>
+        <span class="spacer"></span>
+        <span id="scNeed" class="muted"></span>
+        <button class="b primary" id="btnScenarios">Szenarien ausführen</button>
+      </div>
+      <table><thead><tr><th></th><th>ID</th><th>Szenario</th><th>EGs</th><th>Letztes Ergebnis</th></tr></thead><tbody id="scList"></tbody></table>
+    </div>
+    <div class="panel" id="scDetail" style="margin-top:16px" hidden></div>
   </section>
 
   <!-- ======================================================= MANUELL -->
@@ -263,6 +297,7 @@ function showTab(t) {
   if (t === "requests") { if ($("#rqSource").value === "manual") loadManualLog(); renderRequests(); }
   if (t === "result") loadReportList();
   if (t === "manual") { renderManualEgs(); if (S.mock) loadMockMarkets(); }
+  if (t === "scenarios") renderScenarios();
 }
 
 // --------------------------------------------------------- Pfad-Helfer
@@ -313,9 +348,12 @@ function showConfigError(msg) {
 
 // ------------------------------------------------------------ Lauf-Formular
 function bindRunForm() {
-  $$("#tab-run [data-path]").forEach(el => {
+  $$("[data-path]").forEach(el => {
     writeInput(el, getPath(S.config, el.dataset.path));
-    el.oninput = el.onchange = () => { setPath(S.config, el.dataset.path, readInput(el)); scheduleSave(); };
+    el.oninput = el.onchange = () => {
+      setPath(S.config, el.dataset.path, readInput(el)); scheduleSave();
+      if (el.dataset.path.startsWith("platform.admin")) renderEgs();
+    };
   });
   const qh = getPath(S.config, "behaviour.quarterHour.intervals") ?? "all";
   $("#qhMode").value = typeof qh === "number" ? "n" : qh;
@@ -382,7 +420,7 @@ function renderEgs() {
         ${st} ${creds}
         <span class="spacer"></span>
         <button class="b" data-act="register" data-uid="${c.uid}" title="POST /energy-communities">Registrieren</button>
-        ${S.mock ? `<button class="b" data-act="approve" data-uid="${c.uid}" title="nur im Mock: Admin schaltet frei">Mock: freischalten</button>` : ""}
+        ${hasAdmin() ? `<button class="b" data-act="provision" data-uid="${c.uid}" title="per Admin-Key registrieren, freischalten, Zugangsdaten holen">Automatisch einrichten</button>` : ""}
         <button class="b" data-act="test" data-uid="${c.uid}">Verbindung testen</button>
         <button class="b" data-act="dup" data-uid="${c.uid}" title="duplizieren">⧉</button>
         <button class="b danger" data-act="del" data-uid="${c.uid}" title="entfernen">✕</button>
@@ -417,6 +455,7 @@ function renderEgs() {
   }).join("") : `<div class="panel muted">Noch keine EG. Mit „+ EG hinzufügen“ anlegen.</div>`;
   bindEgs();
 }
+function hasAdmin() { const p = S.config.platform || {}; return !!(p.adminApiKey || (p.adminEmail && p.adminPassword)); }
 function eg(uid) { return S.config.communities.find(c => c.uid === uid); }
 function bindEgs() {
   $$("#egList [data-f]").forEach(el => el.oninput = el.onchange = () => {
@@ -471,9 +510,12 @@ async function egAction(act, uid, btn) {
       } else {
         out.innerHTML = `<div><span class="chip err">${r.status || "Fehler"}</span> ${esc(r.error || (r.response && (r.response.code + " – " + r.response.message)) || "")}</div>`;
       }
-    } else if (act === "approve") {
-      const r = await api("POST", `/api/communities/${uid}/approve`, {});
-      S.config = r.config; renderEgs(); $("#egres-" + uid).innerHTML = `<span class="chip ok">freigeschaltet</span> Zugangsdaten eingetragen`;
+    } else if (act === "provision") {
+      out.innerHTML = `<span class="muted">richte ein …</span>`;
+      const r = await api("POST", `/api/communities/${uid}/provision`, {});
+      S.config = r.config; renderEgs();
+      $("#egres-" + uid).innerHTML = r.ok ? `<span class="chip ok">eingerichtet</span> registriert, freigeschaltet, Zugangsdaten eingetragen`
+        : `<span class="chip err">Fehler</span> ${esc(r.messages.join(" · "))}`;
     }
   } catch (e) { out.innerHTML = `<span class="chip err">Fehler</span> ${esc(e.message)}`; }
   finally { btn.disabled = false; }
@@ -523,14 +565,14 @@ async function poll() {
     if (r.requests.length) { S.runRequests.push(...r.requests); S.reqSince = r.requests[r.requests.length - 1].seq; if ($("#tab-requests").classList.contains("active")) renderRequests(); }
     S.run = r; updateRunUi();
     if (r.status === "running") return setTimeout(poll, 1000);
-    if (r.report) { S.report = r.report; renderReport(r.report, r.reportFile); appendLog([{ level: "INFO", text: `— fertig: ${r.report.totals.errors} Fehler, ${r.report.totals.checksFailed} fehlgeschlagene Checks. Details im Tab „Ergebnis“.` }]); }
+    if (r.report) { S.report = r.report; renderReport(r.report, r.reportFile); if (r.report.scenarios && r.report.scenarios.length) { S.lastScenarios = r.report.scenarios; renderScenarios(); } appendLog([{ level: "INFO", text: `— fertig: ${r.report.totals.errors} Fehler, ${r.report.totals.checksFailed} fehlgeschlagene Checks. Details im Tab „Ergebnis“.` }]); }
     if (r.error) appendLog([{ level: "ERROR", text: r.error }]);
   } catch (e) { setTimeout(poll, 2000); }
 }
 function updateRunUi() {
   const running = S.run && S.run.status === "running";
   $("#btnStop").disabled = !running;
-  $("#btnRun").disabled = $("#btnVerify").disabled = running || !$("#configError").hidden;
+  $("#btnRun").disabled = $("#btnVerify").disabled = $("#btnScenarios").disabled = running || !$("#configError").hidden;
   const chip = $("#runChip");
   const st = S.run ? S.run.status : "idle";
   const t = S.run && S.run.report ? S.run.report.totals : null;
@@ -544,7 +586,7 @@ async function loadReportList() {
   try {
     const list = await api("GET", "/api/reports");
     const sel = $("#repSelect"); const cur = sel.value;
-    sel.innerHTML = `<option value="">Letzter Lauf (diese Sitzung)</option>` + list.map(r => `<option value="${esc(r.file)}">${esc(r.file.replace("egsim-", "").replace(".json", ""))} · ${r.mode === "verify" ? "Prüfung" : "Lauf"} · ${r.totals ? r.totals.errors + " Fehler, " + r.totals.checksFailed + " Checks rot" : ""}</option>`).join("");
+    sel.innerHTML = `<option value="">Letzter Lauf (diese Sitzung)</option>` + list.map(r => `<option value="${esc(r.file)}">${esc(r.file.replace("egsim-", "").replace(".json", ""))} · ${r.mode === "verify" ? "Prüfung" : r.mode === "scenarios" ? "Szenarien" : "Lauf"} · ${r.totals ? r.totals.errors + " Fehler, " + r.totals.checksFailed + " Checks rot" : ""}</option>`).join("");
     sel.value = cur;
   } catch (_) {}
 }
@@ -563,7 +605,7 @@ function renderReport(rep, file) {
     return `<tr><td>${esc(m.deliveryDate)}</td><td>${esc(m.resolution || "–")}</td><td>${esc(m.marketStatusAtStart || "–")} → ${esc(m.marketStatusAtEnd || "–")}</td>
       <td>${m.positionsSubmitted}/${m.positionsPlanned}${m.submissionsFailed ? ` <span class="chip err">${m.submissionsFailed} abgelehnt</span>` : ""}</td><td>${m.updates}</td><td>${m.cancellations}</td>
       <td>${esc(m.offersKwh)} / ${esc(m.demandKwh)}</td>
-      <td>${v ? `<span class="chip ${v.status === "OK" ? "ok" : "err"}">${esc(v.status)}</span> <span class="muted">${v.mode === "full" ? "vollständig nachgerechnet" : "EG-Sicht"}, ${v.comparisons} Vergleiche</span>` : `<span class="muted">–</span>`}</td></tr>
+      <td>${v ? `<span class="chip ${v.status === "OK" ? "ok" : "err"}">${esc(v.status)}</span> <span class="muted">${v.mode === "admin" ? "vollständig inkl. Tagesergebnis (Admin)" : v.mode === "full" ? "vollständig nachgerechnet" : "EG-Sicht"}, ${v.comparisons} Vergleiche</span>` : `<span class="muted">–</span>`}</td></tr>
       ${v && v.reference ? `<tr><td></td><td colspan="7" class="muted">Referenz: Einkauf ${esc(v.reference.purchaseCostEur)} €, Verkauf ${esc(v.reference.salesRevenueEur)} €, Reserve ${esc(v.reference.reserveDispatchedKwh)} kWh / ${esc(v.reference.reserveCostEur)} €, Marge ${esc(v.reference.marginEur)} €</td></tr>` : ""}`;
   }).join("");
   const comms = rep.communities.map(c => `<tr><td>${esc(c.name)}</td><td class="mono">${esc(c.id || "–")}</td><td>${c.ready ? `<span class="chip ok">angemeldet</span>` : `<span class="chip warn">${esc(c.problem || "nicht angemeldet")}</span>`}</td></tr>`).join("");
@@ -571,9 +613,10 @@ function renderReport(rep, file) {
     ${rep.stopped ? `<div class="banner warn">Lauf wurde abgebrochen – Ergebnis unvollständig.</div>` : ""}
     <div class="cards">
       ${card(t.errors, "Fehler", t.errors ? "err" : "ok")}${card(t.warnings, "Warnungen", t.warnings ? "warn" : "")}
-      ${card(t.checksPassed, "Checks bestanden", "ok")}${card(t.checksFailed, "Checks fehlgeschlagen", t.checksFailed ? "err" : "")}${card(t.requests, "Requests", "")}
+      ${t.scenariosPassed + t.scenariosFailed ? card(`${t.scenariosPassed}/${t.scenariosPassed + t.scenariosFailed}`, "Szenarien bestanden", t.scenariosFailed ? "err" : "ok") : card(t.checksPassed, "Checks bestanden", "ok")}${card(t.checksFailed, "Checks fehlgeschlagen", t.checksFailed ? "err" : "")}${card(t.requests, "Requests", "")}
     </div>
     <div class="panel"><h2>Märkte</h2><table><thead><tr><th>Liefertag</th><th>Auflösung</th><th>Status</th><th>Positionen</th><th>geändert</th><th>storniert</th><th>Angebot / Bedarf kWh</th><th>Ergebnisprüfung</th></tr></thead><tbody>${markets || `<tr><td colspan="8" class="muted">keine</td></tr>`}</tbody></table></div>
+    ${rep.scenarios && rep.scenarios.length ? `<div class="panel" style="margin-top:16px"><h2>Szenarien</h2>${scenarioTable(rep.scenarios)}</div>` : ""}
     <div class="grid cols-2" style="margin-top:16px">
       <div class="panel"><h2>Befunde</h2><div class="toolbar"><label><input type="checkbox" id="fOnlyErr" checked> nur Fehler und Warnungen</label></div><div class="scroll" id="findings"></div></div>
       <div class="panel"><h2>Checks</h2><div class="toolbar"><select id="cFilter" style="width:auto"><option value="FAIL">fehlgeschlagen</option><option value="">alle</option><option value="SKIP">übersprungen</option></select></div><div class="scroll" id="checks"></div></div>
@@ -620,6 +663,47 @@ function showRequest(r) {
     ${r.request != null ? `<h3>Request-Body</h3><pre class="json">${fmtJson(r.request)}</pre>` : ""}
     <h3>Antwort</h3><pre class="json">${r.response != null ? fmtJson(r.response) : "(leer)"}</pre>`;
 }
+
+// --------------------------------------------------------------- Szenarien
+S.catalog = []; S.lastScenarios = [];
+function scenarioTable(list) {
+  return `<table><thead><tr><th>ID</th><th>Szenario</th><th>Markt</th><th>Ergebnis</th><th>Details</th></tr></thead><tbody>${list.map(x => `<tr>
+    <td><span class="chip ${x.result === "PASS" ? "ok" : x.result === "FAIL" ? "err" : x.result === "PENDING" ? "warn" : ""}">${esc(x.id)}</span></td>
+    <td>${esc(x.title)}</td><td class="mono">${esc(x.deliveryDate || "–")} ${esc(x.intervalStart ? x.intervalStart.slice(11, 16) + " UTC" : "")}</td>
+    <td>${{PASS: "bestanden", FAIL: "fehlgeschlagen", SKIP: "übersprungen", PENDING: "offen"}[x.result] || esc(x.result)}</td>
+    <td>${x.messages.map(m => `<div>${esc(m)}</div>`).join("")}${x.positions.filter(p => p.slot).length ? `<details><summary>Positionen</summary><table><tbody>${x.positions.filter(p => p.slot).map(p => `<tr><td>${esc(p.slot)}</td><td>${esc(p.eg)}</td><td>${esc(p.type)} ${esc(p.quantityKwh)} kWh</td><td>${esc(p.status || "")}</td><td>${esc(p.allocatedKwh ?? "–")} kWh</td><td>${esc(p.reason || "")}</td><td>${p.trades} Trades</td></tr>`).join("")}</tbody></table></details>` : ""}${x.positions.filter(p => p.info).map(p => `<div class="muted">${esc(p.info)}</div>`).join("")}</td></tr>`).join("")}</tbody></table>`;
+}
+async function renderScenarios() {
+  if (!S.catalog.length) S.catalog = await api("GET", "/api/scenarios");
+  const sel = new Set(S.config.run.scenarios || []);
+  const last = Object.fromEntries((S.lastScenarios || []).map(x => [x.id, x]));
+  $("#scList").innerHTML = S.catalog.map(sc => {
+    const l = last[sc.id];
+    return `<tr><td><input type="checkbox" data-sc="${sc.id}" ${sel.has(sc.id) ? "checked" : ""}></td><td class="mono">${esc(sc.id)}</td>
+      <td><b>${esc(sc.title)}</b>${sc.admin ? ` <span class="chip warn">Admin-Key</span>` : ""}${sc.kind === "market" ? ` <span class="chip info">15-Min-Markt</span>` : ""}<div class="muted">${esc(sc.description)}</div></td>
+      <td>${sc.kind === "market" ? "alle/1" : sc.egs}</td>
+      <td>${l ? `<span class="chip ${l.result === "PASS" ? "ok" : l.result === "FAIL" ? "err" : "warn"}">${{PASS: "bestanden", FAIL: "fehlgeschlagen", SKIP: "übersprungen", PENDING: "offen"}[l.result]}</span>` : ""}</td></tr>`;
+  }).join("");
+  $$("#scList [data-sc]").forEach(cb => cb.onchange = () => {
+    S.config.run.scenarios = $$("#scList [data-sc]").filter(x => x.checked).map(x => x.dataset.sc); scheduleSave(); updateScNeed();
+  });
+  $("#scAll").checked = S.catalog.every(sc => sel.has(sc.id));
+  $("#scAll").onchange = () => { S.config.run.scenarios = $("#scAll").checked ? S.catalog.map(sc => sc.id) : []; scheduleSave(); renderScenarios(); };
+  updateScNeed();
+  const det = $("#scDetail");
+  det.hidden = !(S.lastScenarios && S.lastScenarios.length);
+  if (!det.hidden) det.innerHTML = `<h2>Letzter Szenario-Lauf</h2>${scenarioTable(S.lastScenarios)}`;
+}
+function updateScNeed() {
+  const sel = S.catalog.filter(sc => (S.config.run.scenarios || []).includes(sc.id) && sc.kind === "interval");
+  const need = Math.max(0, ...sel.map(sc => sc.egs - (sc.admin ? 1 : 0)));
+  const have = S.config.communities.filter(c => c.enabled !== false && (c.apiKey || (c.email && c.password))).length;
+  $("#scNeed").textContent = sel.length ? (hasAdmin() ? `braucht ${need} EGs – fehlende legt EGSim per Admin-Key an` : `braucht ${need} EGs mit Zugangsdaten (vorhanden: ${have})`) : "";
+}
+$("#btnScenarios").onclick = async () => {
+  if (!(S.config.run.scenarios || []).length) { alert("Bitte mindestens ein Szenario auswählen."); return; }
+  showTab("run"); await startRun("scenarios");
+};
 
 // ---------------------------------------------------------------- Manuell
 function isoDate(spec) {
@@ -704,7 +788,7 @@ $("#mkCapSet").onclick = async () => { await api("PUT", "/api/mock/reserve", { c
   if (st.run) {
     S.run = st.run; S.logSince = 0; S.reqSince = 0; updateRunUi();
     if (st.run.status === "running") poll();
-    else { const r = await api("GET", "/api/run?logSince=0&reqSince=0"); appendLog(r.logs); S.logSince = r.logTotal; S.runRequests = r.requests; if (r.report) { S.report = r.report; renderReport(r.report, r.reportFile); } }
+    else { const r = await api("GET", "/api/run?logSince=0&reqSince=0"); appendLog(r.logs); S.logSince = r.logTotal; S.runRequests = r.requests; if (r.report) { S.report = r.report; S.lastScenarios = r.report.scenarios || []; renderReport(r.report, r.reportFile); } }
   }
 })();
 </script>

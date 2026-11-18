@@ -5,8 +5,11 @@ Die Datei enthält Zugangsdaten der EGs – nicht einchecken.
 """
 from __future__ import annotations
 
+import base64
+import hmac
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -106,10 +109,10 @@ class UiState:
                 logger.setLevel(logging.INFO)
             try:
                 sim = Simulator(cfg, stats=stats, stop=stop)
-                report = sim.verify_only() if kind == "verify" else sim.run()
+                report = {"verify": sim.verify_only, "scenarios": sim.run_scenarios}.get(kind, sim.run)()
                 run["report"] = report
                 run["reportFile"] = self._write_report(report, cfg.report_dir)
-                self._sync_rotated_keys(cfg)
+                self.sync_communities(cfg)
                 run["status"] = "stopped" if report.get("stopped") else "done"
             except Exception as exc:  # noqa: BLE001
                 log.exception("Lauf fehlgeschlagen")
@@ -130,17 +133,27 @@ class UiState:
         p = write_report(report, str(Path(report_dir) / "egsim-{timestamp}.json"))
         return p.name if p else None
 
-    def _sync_rotated_keys(self, cfg) -> None:
-        """Falls ein Check (ROLE-05) fälschlich neue Zugangsdaten erzeugt hat, diese übernehmen."""
+    def sync_communities(self, cfg) -> None:
+        """Vom Simulator angelegte oder geänderte Zugangsdaten (automatische Einrichtung) in die Datei übernehmen."""
+        fields = {"email": "email", "api_key": "apiKey", "password": "password",
+                  "energy_community_id": "energyCommunityId"}
         changed = False
         with self.lock:
+            comms = self.raw.setdefault("communities", [])
             for c in cfg.communities:
                 try:
                     raw = self.community(c.uid)
                 except KeyError:
-                    continue
-                if c.api_key and raw.get("apiKey") != c.api_key:
-                    raw["apiKey"] = c.api_key
+                    raw = new_community_dict(c.name, uid=c.uid, description=c.description or "")
+                    comms.append(raw)
+                    changed = True
+                for attr, key in fields.items():
+                    v = getattr(c, attr)
+                    if v and raw.get(key) != v:
+                        raw[key] = v
+                        changed = True
+                if c.energy_community_id and raw.get("registeredStatus") != "ACTIVE" and c.api_key:
+                    raw["registeredStatus"] = "ACTIVE"
                     changed = True
             if changed:
                 self.save()
@@ -232,9 +245,23 @@ def manual_request(state: UiState, payload: dict) -> dict:
 
 
 # ======================================================================================================================
-def make_handler(state: UiState):
+def make_handler(state: UiState, password: str | None = None, user: str = "egsim"):
+    """password: optionaler Schutz per HTTP Basic Auth (z. B. auf einem VPS). /healthz bleibt offen."""
+    expected = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode() if password else None
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def _authorized(self) -> bool:
+            if not expected or urlparse(self.path).path == "/healthz":
+                return True
+            if hmac.compare_digest(self.headers.get("Authorization", ""), expected):
+                return True
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="EGSim", charset="UTF-8"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
 
         def log_message(self, fmt, *args):  # noqa: N802
             log.debug("%s - %s", self.address_string(), fmt % args)
@@ -259,6 +286,8 @@ def make_handler(state: UiState):
             return json.loads(self.rfile.read(n))
 
         def do_GET(self):  # noqa: N802
+            if not self._authorized():
+                return
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             try:
@@ -277,6 +306,8 @@ def make_handler(state: UiState):
             self._with_body("DELETE")
 
         def _with_body(self, method: str) -> None:
+            if not self._authorized():
+                return
             u = urlparse(self.path)
             try:
                 body = self._json()
@@ -299,6 +330,9 @@ def make_handler(state: UiState):
             if method == "GET" and not parts:
                 self._send(200, (STATIC / "index.html").read_bytes(), "text/html")
                 return
+            if method == "GET" and parts == ["healthz"]:
+                self._send(200, {"status": "UP", "version": __version__})
+                return
             if not parts or parts[0] != "api":
                 self._send(404, {"error": "unbekannter Pfad"})
                 return
@@ -318,6 +352,9 @@ def make_handler(state: UiState):
                     state.raw = body
                     state.save()
                 self._send(200, {"saved": True, "configError": state.validate()})
+            elif p == ["scenarios"] and method == "GET":
+                from egsim.scenarios import catalog_info
+                self._send(200, catalog_info())
             elif p == ["config", "default-community"] and method == "GET":
                 self._send(200, new_community_dict())
             elif len(p) == 3 and p[0] == "communities" and method == "POST":
@@ -365,6 +402,19 @@ def make_handler(state: UiState):
                         state.save()
                 self._send(200, {"status": r.status, "response": _to_jsonable(r.body), "error": r.error,
                                  "config": state.raw})
+            elif action == "provision":
+                from egsim.simulator import SimEG, Simulator
+                cfg, com = state.parsed_community(uid)
+                sim = Simulator(cfg, stats=state.manual_stats)
+                sim.setup_admin()
+                if not sim.admin:
+                    err = next((f.message for f in sim.findings.items), "kein Admin-Key eingetragen")
+                    raise ValueError(f"Automatische Einrichtung braucht einen gültigen Admin-Key: {err}")
+                eg = SimEG(key=com.name, cfg=com)
+                ok = sim.provision(eg) and sim._try_connect(eg, quiet=False)
+                state.sync_communities(cfg)
+                msgs = [f.message for f in sim.findings.items if f.severity in ("error", "warning")]
+                self._send(200, {"ok": bool(ok), "messages": msgs, "config": state.raw})
             elif action == "approve" and state.mock:
                 raw = state.community(uid)
                 if not raw.get("energyCommunityId"):
@@ -480,8 +530,13 @@ def mock_config(url: str, egs: list[dict]) -> dict:
     ]
     cfg = default_config_dict()
     cfg["platform"]["baseUrl"] = url
+    cfg["platform"]["adminApiKey"] = "admin-key"
     cfg["run"]["waitForSettlementMinutes"] = 5
     cfg["run"]["allParticipantsSimulated"] = True
+    cfg["run"]["closeMarket"] = True
+    cfg["run"]["scenarioDates"] = ["+2"]
+    from egsim.scenarios import CATALOG
+    cfg["run"]["scenarios"] = [sc.id for sc in CATALOG]
     cfg["communities"] = [new_community_dict(e["name"], email=e["email"], apiKey=e["apiKey"], password=e["password"],
                                              energyCommunityId=e["id"], **flows[i % len(flows)])
                           for i, e in enumerate(egs)]
@@ -497,12 +552,16 @@ def serve(args) -> None:
         config_path.write_text(json.dumps(mock_config(mock_url, egs), indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"Mock läuft auf {mock_url} mit {len(egs)} Demo-EGs; Märkte schließen automatisch nach closesAt")
     state = UiState(config_path, mock, mock_url)
-    srv = ThreadingHTTPServer((args.host, args.port), make_handler(state))
+    password = os.environ.get("EGSIM_UI_PASSWORD") or None
+    user = os.environ.get("EGSIM_UI_USER") or "egsim"
+    srv = ThreadingHTTPServer((args.host, args.port), make_handler(state, password, user))
     srv.daemon_threads = True
     url = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{srv.server_address[1]}"
     print(f"EGSim-UI: {url}  (Konfiguration: {config_path.resolve()}) – Strg+C beendet")
-    if args.host not in ("127.0.0.1", "localhost"):
-        print("Achtung: Die UI ist ohne Anmeldung erreichbar und zeigt Zugangsdaten der EGs.")
+    if password:
+        print(f"UI ist passwortgeschützt (Benutzer: {user}, Passwort aus EGSIM_UI_PASSWORD)")
+    elif args.host not in ("127.0.0.1", "localhost"):
+        print("Achtung: Die UI ist ohne Anmeldung erreichbar und zeigt Zugangsdaten. EGSIM_UI_PASSWORD setzen!")
     if args.open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:

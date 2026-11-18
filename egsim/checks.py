@@ -415,3 +415,66 @@ def run_account_checks(sim: "Simulator") -> list[dict]:
               [_err(401, "INVALID_CREDENTIALS"), _err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
         sim.findings.info("check", f"Registrierungstest hat die PENDING-EG {email} angelegt – Admin kann sie löschen")
     return c.results
+
+
+# =====================================================================================================================
+def run_admin_checks(sim: "Simulator") -> list[dict]:
+    """Nur mit Admin-Key der Test-Plattform: Lebenszyklus einer Wegwerf-EG, Statusübergänge, Zugangsdaten, Löschen."""
+    c = Checker(sim, "admin")
+    adm, anon = sim.admin, sim.base
+    rnd = uuid.uuid4().hex[:8]
+    email = f"egsim-admintest-{rnd}@egsim.example"
+
+    c.run("ADM-01", "Admin reicht Position ein → 403",
+          lambda: adm.submit_position({"deliveryDate": "2099-12-31", "type": "DEMAND", "quantityKwh": 1}),
+          [_err(403, "FORBIDDEN")], on_unexpected_success=_cleanup(sim, adm))
+    c.run("ADM-02", "Markt schließen ohne Markt → 404 MARKET_NOT_FOUND", lambda: adm.close_market("2099-12-31"),
+          [_err(404, "MARKET_NOT_FOUND")])
+    c.run("ADM-03", "Tagesergebnis ohne Markt → 404 MARKET_NOT_FOUND", lambda: adm.market_result("2099-12-31"),
+          [_err(404, "MARKET_NOT_FOUND")])
+    r = c.run("ADM-04", "Wegwerf-EG registrieren → 201 PENDING", lambda: anon.register(email, f"EGSim Admin-Test {rnd}"),
+              [_err(201)], extra=lambda r: None if (r.body or {}).get("status") == "PENDING"
+              else f"Status {(r.body or {}).get('status')}")
+    if not r or r.status != 201:
+        c.skip("ADM-*", "weitere Admin-Checks", "Registrierung fehlgeschlagen")
+        return c.results
+    ec_id = r.body["id"]
+    c.run("ADM-05", "Gleichen Status erneut setzen → 200", lambda: adm.set_status(ec_id, "PENDING"), [_err(200)])
+    c.run("ADM-06", "Ungültiger Status → 400 VALIDATION_FAILED", lambda: adm.set_status(ec_id, "DELETED"),
+          [_err(400, "VALIDATION_FAILED")])
+    cred = c.run("ADM-07", "Zugangsdaten für PENDING-EG → 201", lambda: adm.issue_credentials(ec_id), [_err(201)])
+    key = pw = None
+    if cred and cred.status == 201 and isinstance(cred.body, dict):
+        key, pw = cred.body.get("apiKey"), cred.body.get("password")
+        c.run("ADM-08", "PENDING-EG mit API-Key → 403 ENERGY_COMMUNITY_NOT_ACTIVE", anon.with_auth(api_key=key).me,
+              [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
+        c.run("ADM-09", "PENDING-EG Login → 403 ENERGY_COMMUNITY_NOT_ACTIVE", lambda: anon.login(email, pw),
+              [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
+    c.run("ADM-10", "PENDING → ACTIVE → 200", lambda: adm.set_status(ec_id, "ACTIVE"), [_err(200)])
+    c.run("ADM-11", "ACTIVE → PENDING → 409 INVALID_STATUS_TRANSITION", lambda: adm.set_status(ec_id, "PENDING"),
+          [_err(409, "INVALID_STATUS_TRANSITION")])
+    if key:
+        c.run("ADM-12", "Aktive EG mit API-Key → 200", anon.with_auth(api_key=key).me, [_err(200)])
+        new = c.run("ADM-13", "Zugangsdaten neu vergeben → 201", lambda: adm.issue_credentials(ec_id), [_err(201)])
+        c.run("ADM-14", "Alter API-Key nach Neuvergabe → 401", anon.with_auth(api_key=key).me, [_err(401, "UNAUTHORIZED")])
+        if new and new.status == 201 and isinstance(new.body, dict):
+            key = new.body.get("apiKey")
+    c.run("ADM-15", "ACTIVE → SUSPENDED → 200", lambda: adm.set_status(ec_id, "SUSPENDED"), [_err(200)])
+    if key:
+        c.run("ADM-16", "Gesperrte EG mit API-Key → 403 ENERGY_COMMUNITY_NOT_ACTIVE", anon.with_auth(api_key=key).me,
+              [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
+    c.run("ADM-17", "SUSPENDED → ACTIVE → 200", lambda: adm.set_status(ec_id, "ACTIVE"), [_err(200)])
+    c.run("ADM-18", "EG-Liste mit Statusfilter → nur ACTIVE", lambda: adm.list_communities("ACTIVE"), [_err(200)],
+          extra=lambda r: None if all(x.get("status") == "ACTIVE" for x in (r.body or [])) else "Filter wirkt nicht")
+    c.run("ADM-19", "EG ohne Positionen löschen → 204", lambda: adm.delete_community(ec_id), [_err(204)])
+    c.run("ADM-20", "Gelöschte EG abrufen → 404", lambda: adm.get_community(ec_id), [_err(404, "ENERGY_COMMUNITY_NOT_FOUND")])
+    used = next((e for e in sim.egs if e.ready and any(sp.id and sp.eg is e for m in sim.markets for sp in m.positions)), None)
+    if used:
+        c.run("ADM-21", "EG mit Positionen löschen → 409 ENERGY_COMMUNITY_IN_USE", lambda: adm.delete_community(used.id),
+              [_err(409, "ENERGY_COMMUNITY_IN_USE")])
+    settled = next((m for m in sim.markets if m.final_status == "SETTLED"), None)
+    if settled:
+        c.run("ADM-22", "Markt erneut schließen (idempotent) → 200 SETTLED", lambda: adm.close_market(settled.delivery_date),
+              [_err(200)], extra=lambda r: None if (r.body or {}).get("status") == "SETTLED"
+              else f"Status {(r.body or {}).get('status')}")
+    return c.results

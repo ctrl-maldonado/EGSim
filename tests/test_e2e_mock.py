@@ -2,6 +2,7 @@
 import json
 import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import timedelta
 from decimal import Decimal
@@ -151,3 +152,108 @@ def test_ui_api_lauf(tmp_path):
     finally:
         ui.shutdown()
         srv.shutdown()
+
+
+# ---------------------------------------------------------------- Admin-Key, automatische Einrichtung, Szenarien
+def _admin_setup(platform, resolution="QUARTER_HOUR", **run):
+    d = resolve_delivery_date("tomorrow").isoformat()
+    platform.add_market(d, resolution, closes_at=now_utc() + timedelta(hours=1))
+    srv = start_server(platform)
+    raw = default_config_dict()
+    raw["platform"].update(baseUrl=f"http://127.0.0.1:{srv.server_address[1]}", adminApiKey="admin-key")
+    raw["run"].update({"seed": 3, "deliveryDates": [d], "reportDir": None, "closeMarket": True, **run})
+    raw["communities"] = [new_community_dict(f"Auto {i}", **FLOWS[i]) for i in range(3)]  # ohne Zugangsdaten
+    return srv, raw, d
+
+
+def test_automatische_einrichtung_admin_checks_und_volle_pruefung():
+    p = MockPlatform()
+    srv, raw, d = _admin_setup(p)
+    try:
+        cfg = parse_config(raw)
+        rep = Simulator(cfg).run()
+    finally:
+        srv.shutdown()
+    assert rep["totals"]["errors"] == 0, [f for f in rep["findings"] if f["severity"] != "info"]
+    assert sorted(rep["provisioned"]) == ["Auto 0", "Auto 1", "Auto 2"]
+    assert all(c.api_key and c.energy_community_id for c in cfg.communities)  # für die UI zurückgeschrieben
+    assert any(c["id"].startswith("ADM-") and c["result"] == "PASS" for c in rep["checks"])
+    assert rep["markets"][0]["verification"]["mode"] == "admin"
+    assert rep["markets"][0]["verification"]["status"] == "OK"
+
+
+def test_alle_szenarien_bestehen_gegen_mock():
+    from egsim.scenarios import CATALOG
+    p = MockPlatform()
+    srv, raw, d = _admin_setup(p, scenarios=[s.id for s in CATALOG])
+    raw["communities"] = []
+    try:
+        rep = Simulator(parse_config(raw)).run_scenarios()
+    finally:
+        srv.shutdown()
+    res = {s["id"]: s for s in rep["scenarios"]}
+    assert set(res) == {s.id for s in CATALOG}
+    assert all(s["result"] == "PASS" for s in res.values()), {k: v["messages"] for k, v in res.items() if v["result"] != "PASS"}
+    assert rep["totals"]["errors"] == 0
+
+
+def test_szenarien_im_tagesmarkt_und_ohne_admin():
+    p = MockPlatform()
+    srv, raw, d = _setup(p, "DAY", n=3, scenarios=["SZ-05", "SZ-01", "SZ-12"], waitForSettlementMinutes=1)
+    try:
+        threading.Timer(3, p.close_market, args=(d,)).start()
+        rep = Simulator(parse_config(raw)).run_scenarios()
+    finally:
+        srv.shutdown()
+    res = {s["id"]: s["result"] for s in rep["scenarios"]}
+    assert res == {"SZ-05": "PASS", "SZ-01": "SKIP", "SZ-12": "SKIP"}  # ein Szenario je Tagesmarkt, SZ-12 braucht Admin
+
+
+class FalscherRest(MockPlatform):
+    """Verteilt den Rundungsrest an das zuletzt eingereichte statt an das erste Angebot."""
+
+    def _settle(self, d):
+        super()._settle(d)
+        by_iv = {}
+        for a in self.results[d]["allocations"]:
+            if a["reason"] == "PARTIALLY_ALLOCATED":
+                by_iv.setdefault(a["intervalStart"], []).append(a)
+        for allocs in by_iv.values():
+            hi = [a for a in allocs if a["allocatedKwh"] == max(x["allocatedKwh"] for x in allocs)]
+            lo = [a for a in allocs if a["allocatedKwh"] == min(x["allocatedKwh"] for x in allocs)]
+            if hi and lo and hi[0] is not lo[-1]:
+                hi[0]["allocatedKwh"], lo[-1]["allocatedKwh"] = lo[-1]["allocatedKwh"], hi[0]["allocatedKwh"]
+
+
+def test_szenario_erkennt_falschen_rundungsrest():
+    p = FalscherRest()
+    srv, raw, d = _admin_setup(p, scenarios=["SZ-04", "SZ-01"])
+    raw["communities"] = []
+    try:
+        rep = Simulator(parse_config(raw)).run_scenarios()
+    finally:
+        srv.shutdown()
+    res = {s["id"]: s for s in rep["scenarios"]}
+    assert res["SZ-01"]["result"] == "PASS"
+    assert res["SZ-04"]["result"] == "FAIL"
+    assert any("3.334" in m for m in res["SZ-04"]["messages"])
+
+
+def test_ui_passwortschutz(tmp_path):
+    from http.server import ThreadingHTTPServer
+
+    from egsim.ui.server import UiState, make_handler
+    ui = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(UiState(tmp_path / "c.json"), "geheim"))
+    threading.Thread(target=ui.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{ui.server_address[1]}"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(base + "/api/state")
+        assert e.value.code == 401
+        assert urllib.request.urlopen(base + "/healthz").status == 200
+        import base64
+        req = urllib.request.Request(base + "/api/state",
+                                     headers={"Authorization": "Basic " + base64.b64encode(b"egsim:geheim").decode()})
+        assert urllib.request.urlopen(req).status == 200
+    finally:
+        ui.shutdown()

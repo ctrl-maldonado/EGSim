@@ -1,0 +1,43 @@
+# EGSim auf einem VPS – zusammen mit eurer Plattform.
+#   cp deploy/.env.example .env   (Passwort und Domain eintragen)
+#   docker compose up -d --build
+# UI: https://<EGSIM_DOMAIN>  (Benutzer egsim, Passwort aus .env)
+# In der UI als Basis-URL die Plattform im Docker-Netz eintragen, z. B. http://plattform:8080
+
+services:
+  egsim:
+    build: .
+    image: egsim:latest
+    restart: unless-stopped
+    environment:
+      EGSIM_UI_PASSWORD: ${EGSIM_UI_PASSWORD:?EGSIM_UI_PASSWORD in .env setzen}
+    volumes:
+      - egsim-data:/data
+    ports:
+      - "127.0.0.1:8090:8090"   # nur lokal bzw. per SSH-Tunnel; von außen über Caddy (HTTPS)
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      EGSIM_DOMAIN: ${EGSIM_DOMAIN:?EGSIM_DOMAIN in .env setzen}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - egsim
+
+  # Eure Plattform im selben Netz (Beispiel – anpassen, sobald es ein Image gibt):
+  # plattform:
+  #   image: ghcr.io/<team>/handelsplattform:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     ADMIN_API_KEY: ${PLATFORM_ADMIN_API_KEY}
+  #   # keine ports nötig: EGSim erreicht sie intern unter http://plattform:8080
+
+volumes:
+  egsim-data:
+  caddy-data:

@@ -77,8 +77,8 @@ def test_umgebungsvariablen(monkeypatch):
 def test_config_fehler():
     with pytest.raises(ConfigError, match="Profil"):
         _cfg(new_community_dict("X", generation={"profile": "atom", "dailyKwh": 1}))
-    with pytest.raises(ConfigError, match="Erzeugung"):
-        _cfg(new_community_dict("X"))
+    # EG ohne Profil ist erlaubt (reicht im Zufallslauf nichts ein, dient z. B. als Szenario-EG)
+    assert _cfg(new_community_dict("X")).communities[0].generation is None
     with pytest.raises(ConfigError, match="eindeutig"):
         _cfg(PV, dict(PV, uid="other"))
     raw = default_config_dict()
