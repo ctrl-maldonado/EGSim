@@ -40,6 +40,7 @@ class SP:
     price: str | None = None
     update_qty: str | None = None
     cancel: bool = False
+    burst: int = 1  # > 1: dieselbe Position gleichzeitig so oft einreichen (genau eine darf angenommen werden)
 
 
 @dataclass
@@ -51,6 +52,11 @@ class Exp:
     trades: int | None = None
     amounts: dict[str, Callable[[Prices], Decimal]] = field(default_factory=dict)
     reserve_trade_if_full: bool = False
+    rejection_reason: str | None = None
+    # erwartete Trade-Mengen: BUYS, SELLS (aus Angeboten), SELLS_RESERVE (aus der Reserve)
+    trade_qty: dict[str, str] = field(default_factory=dict)
+    # trade_qty und amounts nur prüfen, wenn der Bedarf voll zugeteilt wurde (sonst hat das Kraftwerk nicht voll geliefert)
+    full_only: bool = False
 
 
 @dataclass
@@ -63,6 +69,12 @@ class Scenario:
     kind: str = "interval"  # interval | market
     admin: bool = False
     suspend: str | None = None  # Slot, dessen EG vor Marktschluss gesperrt wird (eigene Wegwerf-EG)
+    parallel: bool = False      # alle Positionen gleichzeitig einreichen (Reihenfolge von createdAt ist dann offen)
+    total_trades: int | None = None  # Gesamtzahl der Trades im Intervall (nur mit Admin-Key prüfbar)
+    # Erwartungen an das Tagesergebnis /result (nur mit Admin-Key): Feldpfad → Menge, z. B. "reserve.requiredKwh"
+    result_qty: dict[str, str] = field(default_factory=dict)
+    # Beträge im Tagesmarkt aus den Preisen des Markts (nur wenn das Kraftwerk die Reserve voll geliefert hat)
+    money: Callable[[Prices], dict[str, Decimal]] | None = None
 
     @property
     def slots(self) -> list[str]:
@@ -70,7 +82,7 @@ class Scenario:
 
     def info(self) -> dict:
         return {"id": self.id, "title": self.title, "description": self.description, "kind": self.kind,
-                "admin": self.admin, "egs": len(self.slots) + (1 if self.suspend else 0)}
+                "admin": self.admin, "egs": len(self.slots) + (1 if self.suspend else 0), "parallel": self.parallel}
 
 
 CATALOG: list[Scenario] = [
@@ -136,13 +148,69 @@ CATALOG: list[Scenario] = [
     Scenario("SZ-12", "Gesperrte EG bei Marktschluss",
              "Eine EG wird nach dem Einreichen gesperrt: ihre Position wird REJECTED und nicht gehandelt.",
              [SP("X", "OFFER", "10"), SP("A", "DEMAND", "10")],
-             [Exp("X", status="REJECTED", trades=0), Exp("A", reasons=ANY_DEMAND, reserve_trade_if_full=True)],
+             [Exp("X", status="REJECTED", trades=0, rejection_reason="ENERGY_COMMUNITY_NOT_ACTIVE"),
+              Exp("A", reasons=ANY_DEMAND, reserve_trade_if_full=True)],
              admin=True, suspend="X"),
+    Scenario("SZ-13", "Unterangebot",
+             "Handelbares Angebot 30 kWh, Bedarf 50 kWh: das Angebot wird ganz gekauft, die Fehlmenge von 20 kWh kommt "
+             "aus der Reserve (Pflichtszenario „Unterangebot“).",
+             [SP("A", "OFFER", "30"), SP("B", "DEMAND", "50")],
+             [Exp("A", "30", ("FULLY_ALLOCATED",), trades=1),
+              Exp("B", reasons=ANY_DEMAND, reserve_trade_if_full=True, full_only=True,
+                  trade_qty={"SELLS": "30", "SELLS_RESERVE": "20"})],
+             result_qty={"totalOfferedKwh": "30", "tradableOfferedKwh": "30", "totalDemandKwh": "50",
+                         "totalPurchasedKwh": "30", "reserve.requiredKwh": "20"}),
+    Scenario("SZ-14", "Beispielablauf aus dem Vertrag",
+             "Angebote 100 kWh (Preisvorstellung 0,02 unter dem Ankaufspreis) und 50 kWh (0,02 darüber, wird nicht "
+             "gehandelt), Bedarf 130 kWh: Reserve 30 kWh. Mit den Preisen des Vertrags (0,10 / 0,14 / 0,20) ergibt das "
+             "Einkauf 10,00, Verkauf 18,20, Reserve 6,00 und eine Marge von 2,20 EUR.",
+             [SP("A", "OFFER", "100", price="buy-0.02"), SP("B", "OFFER", "50", price="buy+0.02"),
+              SP("C", "DEMAND", "130")],
+             [Exp("A", "100", ("FULLY_ALLOCATED",), trades=1,
+                  amounts={"PLATFORM_BUYS": lambda p: round_eur(Decimal("100") * p.buy)}),
+              Exp("B", "0", ("PRICE_NOT_MET",), trades=0),
+              Exp("C", reasons=ANY_DEMAND, reserve_trade_if_full=True, full_only=True,
+                  trade_qty={"SELLS": "100", "SELLS_RESERVE": "30"},
+                  amounts={"PLATFORM_SELLS": lambda p: round_eur(Decimal("100") * p.sell) + round_eur(Decimal("30") * p.sell)})],
+             result_qty={"totalOfferedKwh": "150", "tradableOfferedKwh": "100", "totalDemandKwh": "130",
+                         "totalPurchasedKwh": "100", "reserve.requiredKwh": "30"},
+             money=lambda p: {
+                 "purchaseCostEur": round_eur(Decimal("100") * p.buy),
+                 "salesRevenueEur": round_eur(Decimal("100") * p.sell) + round_eur(Decimal("30") * p.sell),
+                 "reserve.costEur": round_eur(Decimal("30") * p.reserve),
+                 "marginEur": round_eur(Decimal("100") * p.sell) + round_eur(Decimal("30") * p.sell)
+                 - round_eur(Decimal("100") * p.buy) - round_eur(Decimal("30") * p.reserve)}),
+    Scenario("SZ-15", "Reserve wird auf mehrere Bedarfe verteilt",
+             "Handelbares Angebot 30 kWh, nicht handelbares 20 kWh (Preisvorstellung über dem Ankaufspreis, erhöht die "
+             "Reserve), Bedarfe 30 und 20 kWh: Reserve 20 kWh pro rata, also 12 und 8 kWh. Jeder Bedarf bekommt einen "
+             "Trade aus Angeboten (18 und 12 kWh) und einen aus der Reserve.",
+             [SP("A", "OFFER", "30"), SP("B", "OFFER", "20", price="buy+0.01"), SP("C", "DEMAND", "30"),
+              SP("D", "DEMAND", "20")],
+             [Exp("A", "30", ("FULLY_ALLOCATED",), trades=1), Exp("B", "0", ("PRICE_NOT_MET",), trades=0),
+              Exp("C", reasons=ANY_DEMAND, full_only=True, trades=2, trade_qty={"SELLS": "18", "SELLS_RESERVE": "12"}),
+              Exp("D", reasons=ANY_DEMAND, full_only=True, trades=2, trade_qty={"SELLS": "12", "SELLS_RESERVE": "8"})],
+             result_qty={"totalOfferedKwh": "50", "tradableOfferedKwh": "30", "totalDemandKwh": "50",
+                         "totalPurchasedKwh": "30", "reserve.requiredKwh": "20"}),
+    Scenario("SZ-16", "Doppelter Request (gleichzeitig)",
+             "Dieselbe EG reicht dasselbe Angebot gleichzeitig fünfmal ein: genau eine Position wird angenommen, die "
+             "übrigen vier bekommen 409 POSITION_ALREADY_EXISTS. Danach gibt es nur eine Zuteilung und einen Trade.",
+             [SP("A", "OFFER", "20", burst=5), SP("B", "DEMAND", "20")],
+             [Exp("A", "20", ("FULLY_ALLOCATED",), trades=1), Exp("B", "20", ("FULLY_ALLOCATED",), trades=1)],
+             total_trades=2),
+    Scenario("SZ-17", "Parallele Einreichung ohne Überbuchung",
+             "Zwei Angebote à 30 kWh und zwei Bedarfe (25 und 15 kWh) werden gleichzeitig von vier EGs eingereicht. "
+             "Gekauft werden nur 40 kWh (je 20 kWh pro Angebot), die Summen müssen aufgehen.",
+             [SP("A", "OFFER", "30"), SP("B", "OFFER", "30"), SP("C", "DEMAND", "25"), SP("D", "DEMAND", "15")],
+             [Exp("A", "20", ("PARTIALLY_ALLOCATED",), trades=1), Exp("B", "20", ("PARTIALLY_ALLOCATED",), trades=1),
+              Exp("C", "25", ("FULLY_ALLOCATED",), trades=1), Exp("D", "15", ("FULLY_ALLOCATED",), trades=1)],
+             parallel=True, total_trades=4,
+             result_qty={"totalOfferedKwh": "60", "tradableOfferedKwh": "60", "totalDemandKwh": "40",
+                         "totalPurchasedKwh": "40", "totalSoldKwh": "40", "reserve.requiredKwh": "0"}),
     Scenario("SZ-20", "Alle Viertelstunden des Liefertags",
              "Eine EG reicht in jeder Viertelstunde eine Position ein (96, an Umstellungstagen 92/100) und storniert "
              "sie wieder. Braucht einen 15-Minuten-Markt.", kind="market"),
     Scenario("SZ-21", "Lasttest",
-             "Alle EGs reichen gleichzeitig 16 Positionen ab 14:00 Uhr ein und stornieren sie wieder. Prüft auf "
+             "Alle EGs reichen gleichzeitig 16 Positionen ab 15:00 Uhr ein und stornieren sie wieder. Prüft auf "
              "Serverfehler und misst die Latenz. Braucht einen 15-Minuten-Markt.", kind="market"),
 ]
 BY_ID = {s.id: s for s in CATALOG}
@@ -168,7 +236,8 @@ def _price(spec: str | None, prices: Prices) -> Decimal | None:
     if spec is None:
         return None
     if spec.startswith("buy"):
-        return (prices.buy or ZERO) + (D(spec[4:]) if "+" in spec else ZERO)
+        rest = spec[3:]  # "", "+0.02" oder "-0.02"
+        return (prices.buy or ZERO) + (D(rest) if rest else ZERO)
     return D(spec)
 
 
@@ -247,7 +316,7 @@ def run_scenarios(sim: "Simulator") -> None:
         res = m.get("resolution")
         if res == "QUARTER_HOUR":
             start = day_bounds_utc(resolve_delivery_date(d))[0] + timedelta(hours=10)
-            take = queue[:16]  # 10:00–14:00 Uhr; der Lasttest nutzt 14:00–18:00
+            take = queue[:20]  # 10:00–15:00 Uhr; der Lasttest nutzt 15:00–19:00
             placed = [_Placed(s, d, format_utc(start + timedelta(minutes=15 * i)), prices) for i, s in enumerate(take)]
         else:
             take = queue[:1]
@@ -303,22 +372,56 @@ def _place(sim: "Simulator", p: _Placed, slots: list["SimEG"]) -> None:
                               "leeren Markt")
             p.invalid = True
     log.info("%s %s: %s %s", sc.id, sc.title, p.delivery, p.interval or "")
-    for sp in sc.positions:
-        eg = mapping[sp.slot]
+    def body_of(sp: SP) -> dict:
         body: dict = {"deliveryDate": p.delivery, "type": sp.type, "quantityKwh": D(sp.qty)}
         if p.interval:
             body["intervalStart"] = p.interval
         price = _price(sp.price, p.prices)
         if price is not None:
             body["priceExpectationEurPerKwh"] = price
-        r = eg.client.submit_position(body)
-        if r.status != 201:
+        return body
+
+    def submit(sp: SP) -> list:
+        eg, body = mapping[sp.slot], body_of(sp)
+        if sp.burst > 1:  # gleichzeitig dieselbe Position mehrfach
+            with ThreadPoolExecutor(sp.burst) as ex:
+                return list(ex.map(lambda _: eg.client.submit_position(body), range(sp.burst)))
+        return [eg.client.submit_position(body)]
+
+    if sc.parallel:  # alle Positionen gleichzeitig, die Reihenfolge von createdAt ist dem Zufall überlassen
+        with ThreadPoolExecutor(len(sc.positions)) as ex:
+            answers = list(ex.map(submit, sc.positions))
+    else:
+        answers = []
+        for sp in sc.positions:
+            answers.append(submit(sp))
+            time.sleep(0.03)  # eindeutige Reihenfolge von createdAt
+
+    for sp, rs in zip(sc.positions, answers):
+        eg, body = mapping[sp.slot], body_of(sp)
+        created = [r for r in rs if r.status == 201]
+        if sp.burst > 1:
+            wrong = [r for r in rs if r.status != 201 and not (r.status == 409 and r.code == "POSITION_ALREADY_EXISTS")]
+            if len(created) != 1:
+                p.messages.append(f"{sp.slot}: {len(created)} von {sp.burst} gleichzeitigen Requests angenommen, "
+                                  "erwartet genau 1 (Idempotenz verletzt)")
+            if wrong:
+                p.messages.append(f"{sp.slot}: {len(wrong)} doppelte Requests nicht mit 409 POSITION_ALREADY_EXISTS "
+                                  f"abgelehnt ({', '.join(f'{r.status} {r.code or r.error or chr(45)}' for r in wrong[:3])})")
+            q = {"deliveryDate": p.delivery, "status": "OPEN"}
+            if p.interval:
+                q["intervalStart"] = p.interval
+            lst = eg.client.list_positions(**q)
+            if lst.status == 200 and isinstance(lst.body, list) and len(lst.body) != 1:
+                p.messages.append(f"{sp.slot}: {len(lst.body)} offene Positionen für denselben Slot, erwartet genau 1")
+        if not created:
+            first = rs[0]
             p.invalid = True
-            p.messages.append(f"{sp.slot} ({eg.key}): Einreichen {r.status} {r.code or ''}"
-                              + (" – Intervall schon belegt, anderen Liefertag nutzen" if r.code == "POSITION_ALREADY_EXISTS" else ""))
+            p.messages.append(f"{sp.slot} ({eg.key}): Einreichen {first.status} {first.code or ''}"
+                              + (" – Intervall schon belegt, anderen Liefertag nutzen"
+                                 if first.code == "POSITION_ALREADY_EXISTS" else ""))
             continue
-        p.pos[sp.slot] = {"eg": eg, "id": r.body.get("id"), "body": body}
-        time.sleep(0.03)  # eindeutige Reihenfolge von createdAt
+        p.pos[sp.slot] = {"eg": eg, "id": created[0].body.get("id"), "body": body}
     for sp in sc.positions:
         pos = p.pos.get(sp.slot)
         if not pos:
@@ -396,13 +499,30 @@ def _evaluate(sim: "Simulator", p: _Placed, market_status: str | None) -> None:
             if e.reserve_trade_if_full and a.get("reason") == "FULLY_ALLOCATED" \
                     and not any(t.get("fromReserve") for t in tr):
                 msgs.append(f"{w}: voll zugeteilt ohne Reserve-Trade (fromReserve)")
-        if e.trades is not None and len(tr) != e.trades:
+        if e.rejection_reason is not None:
+            got_reason = positions.get(e.slot, {}).get("rejectionReason")
+            if got_reason != e.rejection_reason:
+                msgs.append(f"{w}: rejectionReason {got_reason!r}, erwartet {e.rejection_reason}")
+        # bei full_only gelten Trade-Anzahl, -Mengen und -Beträge nur, wenn der Bedarf voll zugeteilt wurde
+        detail = not e.full_only or (a is not None and a.get("reason") == "FULLY_ALLOCATED")
+        if detail and e.trades is not None and len(tr) != e.trades:
             msgs.append(f"{w}: {len(tr)} Trades, erwartet {e.trades}")
-        for direction, fn in e.amounts.items():
-            exp = fn(p.prices)
-            got = sum((D(t.get("amountEur")) or ZERO for t in tr if t.get("direction") == direction), ZERO)
-            if got != exp:
-                msgs.append(f"{w}: Betrag {direction} {got} €, erwartet {exp} €")
+        if detail:
+            for key, exp_qty in e.trade_qty.items():
+                direction = "PLATFORM_BUYS" if key == "BUYS" else "PLATFORM_SELLS"
+                from_reserve = key.endswith("RESERVE")
+                got_qty = sum((D(t.get("quantityKwh")) or ZERO for t in tr
+                               if t.get("direction") == direction and bool(t.get("fromReserve")) == from_reserve), ZERO)
+                if got_qty != D(exp_qty):
+                    msgs.append(f"{w}: Trade-Menge {key} {got_qty} kWh, erwartet {exp_qty} kWh")
+            for direction, fn in e.amounts.items():
+                exp = fn(p.prices)
+                got = sum((D(t.get("amountEur")) or ZERO for t in tr if t.get("direction") == direction), ZERO)
+                if got != exp:
+                    msgs.append(f"{w}: Betrag {direction} {got} €, erwartet {exp} €")
+
+    if sim.admin and not p.invalid:
+        _check_totals(sim, p, msgs)
 
     # Nachrechnung mit der Referenzlogik (gelieferte Reserve = Summe der Reserve-Trades)
     processed = [Pos.from_api(x) for x in positions.values() if x.get("status") == "PROCESSED"]
@@ -431,6 +551,51 @@ def _evaluate(sim: "Simulator", p: _Placed, market_status: str | None) -> None:
     _result(sim, sc, p.delivery, p.interval, result, msgs, rows)
 
 
+def _path(src: dict, key: str):
+    for part in key.split("."):
+        src = src.get(part) if isinstance(src, dict) else None
+    return src
+
+
+def _check_totals(sim: "Simulator", p: _Placed, msgs: list[str]) -> None:
+    """Mit Admin-Key: Gesamtzahl der Trades im Intervall und Tagesergebnis (/result) des Szenarios prüfen."""
+    sc = p.sc
+    if sc.total_trades is not None:
+        q = {"intervalStart": p.interval} if p.interval else {}
+        r = sim.admin.trades(p.delivery, **q)
+        if r.status == 200 and isinstance(r.body, list):
+            if len(r.body) != sc.total_trades:
+                msgs.append(f"{len(r.body)} Trades im Intervall, erwartet {sc.total_trades} (doppelte oder fehlende Handelsabschlüsse)")
+        else:
+            msgs.append(f"Trades (Admin): HTTP {r.status}")
+    if not sc.result_qty and not sc.money:
+        return
+    r = sim.admin.market_result(p.delivery)
+    if r.status != 200 or not isinstance(r.body, dict):
+        msgs.append(f"Tagesergebnis /result: HTTP {r.status}")
+        return
+    src = r.body
+    if p.interval:
+        src = next((i for i in r.body.get("intervals") or []
+                    if normalize_interval(i.get("intervalStart")) == normalize_interval(p.interval)), None)
+        if src is None:
+            msgs.append("Tagesergebnis: Intervall fehlt in intervals")
+            return
+    for key, exp in sc.result_qty.items():
+        got = _path(src, key)
+        if got is None or D(got) != D(exp):
+            msgs.append(f"Tagesergebnis {key}: {got}, erwartet {exp}")
+    required, dispatched = D(_path(src, "reserve.requiredKwh")), D(_path(src, "reserve.dispatchedKwh"))
+    if dispatched is not None and required is not None and dispatched > required:
+        msgs.append(f"Tagesergebnis: Reserve geliefert ({dispatched}) größer als benötigt ({required})")
+    # Beträge gibt es nur auf Tagesebene (DAY); nur prüfbar, wenn das Kraftwerk die Reserve voll geliefert hat
+    if sc.money and not p.interval and dispatched is not None and dispatched == required:
+        for key, exp in sc.money(p.prices).items():
+            got = _path(src, key)
+            if got is None or D(got) != exp:
+                msgs.append(f"Tagesergebnis {key}: {got}, erwartet {exp}")
+
+
 def _market_scenario(sim: "Simulator", sc: Scenario, d: str, slots: list["SimEG"], spare: list["SimEG"]) -> None:
     ivs = quarter_hours(resolve_delivery_date(d))
     if sc.id == "SZ-20":
@@ -451,7 +616,7 @@ def _market_scenario(sim: "Simulator", sc: Scenario, d: str, slots: list["SimEG"
                 [{"info": msgs[0]}])
         return
     # SZ-21 Lasttest
-    start = day_bounds_utc(resolve_delivery_date(d))[0] + timedelta(hours=14)
+    start = day_bounds_utc(resolve_delivery_date(d))[0] + timedelta(hours=15)
     load_ivs = [format_utc(start + timedelta(minutes=15 * i)) for i in range(16)]
     jobs = [(eg, {"deliveryDate": d, "intervalStart": iv, "type": "DEMAND", "quantityKwh": Decimal("1.5")})
             for eg in slots for iv in load_ivs]

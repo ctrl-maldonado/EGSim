@@ -70,6 +70,7 @@ class MarketRun:
     cancels: int = 0
     final_status: str | None = None
     verification: dict | None = None
+    late_checked: bool = False
 
     def summary(self) -> dict:
         m = self.market or {}
@@ -96,6 +97,9 @@ class Simulator:
     def __init__(self, cfg: Config, *, stats: RequestStats | None = None, stop: threading.Event | None = None) -> None:
         self.cfg = cfg
         self.stats = stats or RequestStats()
+        self.stats.validate_contract = cfg.validate_schema
+        self._contract_mark = self.stats.contract_mark
+        self._contract_reported = False
         self.stop = stop or threading.Event()
         self.findings = Findings()
         self.run_id = now_utc().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:4]
@@ -369,7 +373,15 @@ class Simulator:
             run.final_status = (cur.body or {}).get("status") if cur.status == 200 else run.final_status
 
     def _close(self, run: MarketRun) -> None:
-        r = self.admin.close_market(run.delivery_date)
+        n = max(1, self.cfg.parallel_close)
+        if n > 1:  # gleichzeitige close-Aufrufe: genau ein Settlement, alle Antworten 200/202
+            with ThreadPoolExecutor(n) as ex:
+                answers = list(ex.map(lambda _: self.admin.close_market(run.delivery_date), range(n)))
+            for a in answers[1:]:
+                self._expect(a, (200, 202), "close", f"Admin: paralleler close-Aufruf für {run.delivery_date}")
+            r = answers[0]
+        else:
+            r = self.admin.close_market(run.delivery_date)
         if not self._expect(r, (200, 202), "close", f"Admin: Markt {run.delivery_date} schließen"):
             return
         status = (r.body or {}).get("status")
@@ -408,6 +420,7 @@ class Simulator:
                 if status == "FAILED":
                     self.findings.error("market", f"Settlement FAILED: {(g.body or {}).get('failureReason')}", g.short())
                 return
+            self._late_checks(run, g)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -415,6 +428,19 @@ class Simulator:
                 raise Stopped()
         self.findings.warning("market", f"{run.delivery_date}: nach {self.cfg.wait_for_settlement_minutes:g} min "
                                         f"nicht abgewickelt (Status {run.final_status})")
+
+    def _late_checks(self, run: MarketRun, market_resp: ApiResponse) -> None:
+        """closesAt ist vorbei, der Betreiber hat aber noch nicht geschlossen: einmalig prüfen, dass der Server
+        trotzdem keine Änderungen mehr annimmt (409 MARKET_CLOSED)."""
+        m = market_resp.body if market_resp.status == 200 and isinstance(market_resp.body, dict) else {}
+        if run.late_checked or not self.cfg.checks or not run.positions or m.get("status") != "OPEN" \
+                or not m.get("closesAt"):
+            return
+        if now_utc() < parse_ts(m["closesAt"]):
+            return
+        run.late_checked = True
+        from egsim import checks
+        self.check_results += checks.run_late_market_checks(self, run)
 
     # ------------------------------------------------------------- Positionen
     def _plan(self, run: MarketRun) -> None:
@@ -631,9 +657,22 @@ class Simulator:
             self.findings.warning("run", "Lauf wurde abgebrochen")
         return self.report()
 
+    def _contract_findings(self) -> list[dict]:
+        """Schema-Abweichungen der Antworten (egsim/contract.py) als Befunde, je Endpoint/Status/Meldung einmal."""
+        issues = self.stats.contract_issues(self._contract_mark) if self.cfg.validate_schema else []
+        if not self._contract_reported:
+            self._contract_reported = True
+            for i in issues:
+                n = f" (×{i['count']})" if i["count"] > 1 else ""
+                self.findings.add(i["severity"], "contract",
+                                  f"{i['method']} {i['endpoint']} → {i['status']}: {i['message']}{n}", i["request"])
+        return issues
+
     def report(self) -> dict:
+        contract_issues = self._contract_findings()
         summary = self.stats.summary()
         return {
+            "contractIssues": contract_issues,
             "egsimVersion": __version__,
             "contractVersion": CONTRACT_VERSION,
             "mode": self.mode,

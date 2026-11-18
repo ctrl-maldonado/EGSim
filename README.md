@@ -2,15 +2,16 @@
 
 EGSim simuliert Energiegemeinschaften (EGs), die mit eurer Handelsplattform sprechen (**Datenvertrag 0.2**).
 Er verhält sich wie echte EGs: Er meldet sich an, reicht Angebote und Bedarfe ein, ändert und storniert sie und holt
-nach dem Settlement Zuteilungen und Handelsabschlüsse ab. Dabei prüft er jede Antwort gegen den Vertrag. Dazu kommen
-rund 100 Negativtests (Fehlercodes, Rollen, Mandantentrennung, Validierung) und ein **Katalog gezielter Randfälle**.
+nach dem Settlement Zuteilungen und Handelsabschlüsse ab. Dabei prüft er **jede Antwort gegen die Schemas des Vertrags**
+(siehe „Schema-Prüfung“). Dazu kommen rund 130 Negativ- und Vertragstests (Fehlercodes, Rollen, Mandantentrennung,
+Validierung, Filter, Idempotenz) und ein **Katalog gezielter Randfälle** (auch gleichzeitige und doppelte Requests).
 
 Bedient wird alles über eine **Web-UI**.
 
 ## Schnellstart
 
 ```bash
-pip install -e ".[dev]"          # Python ≥ 3.10, einzige Abhängigkeit: requests
+pip install -e ".[dev]"          # Python ≥ 3.10, Abhängigkeit: requests (unter Windows zusätzlich tzdata)
 
 egsim ui --mock --open           # Demo: eingebauter Mock der Plattform, alles vorkonfiguriert
 egsim ui --open                  # gegen eure Plattform; Konfiguration in egsim-ui.json
@@ -81,12 +82,20 @@ Vertrag abgeleitet, zusätzlich rechnet EGSim jedes Szenario mit der Referenzlog
 | SZ-09 | 1.000.000 kWh | große Beträge ohne Rundungsfehler |
 | SZ-10 | 0,125 kWh | Beträge kaufmännisch gerundet |
 | SZ-11 | Ändern und Stornieren | zählt der letzte Stand, Storno ohne Zuteilung |
-| SZ-12 | EG nach dem Einreichen gesperrt (Admin) | Position `REJECTED` |
+| SZ-12 | EG nach dem Einreichen gesperrt (Admin) | Position `REJECTED` mit `rejectionReason ENERGY_COMMUNITY_NOT_ACTIVE` |
+| SZ-13 | Unterangebot: 30 kWh Angebot, 50 kWh Bedarf | Angebot voll, 20 kWh aus der Reserve |
+| SZ-14 | Beispielablauf aus dem Vertrag (100 + 50 kWh Angebot, 130 kWh Bedarf) | Reserve 30 kWh; mit den Preisen 0,10 / 0,14 / 0,20: Einkauf 10,00, Verkauf 18,20, Reserve 6,00, Marge 2,20 EUR |
+| SZ-15 | Handelbares und nicht handelbares Angebot, zwei Bedarfe | Reserve 20 kWh pro rata auf die Bedarfe (12 / 8 kWh), je ein Trade aus Angeboten und aus der Reserve |
+| SZ-16 | Doppelter Request: dasselbe Angebot gleichzeitig 5-mal | genau eine Position, 4 × `409 POSITION_ALREADY_EXISTS`, ein Trade |
+| SZ-17 | Parallele Einreichung von vier EGs | keine Überbuchung: je 20 kWh pro Angebot, genau 4 Trades, Summen im Tagesergebnis stimmen |
 | SZ-20 | jede Viertelstunde des Tages | 96 bzw. 92/100 an Umstellungstagen angenommen |
 | SZ-21 | Lasttest | alle EGs gleichzeitig, keine Serverfehler, Latenz p95 |
 
+Mit Admin-Key prüfen SZ-13 bis SZ-17 zusätzlich das Tagesergebnis (`/result`) und die Gesamtzahl der Trades. Die
+Beträge von SZ-14 (Marge 2,20) gelten im Tagesmarkt und nur, wenn das Kraftwerk die Reserve voll geliefert hat.
+
 Im **15-Minuten-Markt** bekommt jedes Szenario eine eigene Viertelstunde ab 10:00 Uhr Wiener Zeit, alle laufen auf
-einem Markt. Der Lasttest nutzt 14:00–18:00 Uhr. Im **Tagesmarkt** braucht jedes Szenario einen eigenen Liefertag.
+einem Markt. Der Lasttest nutzt 15:00–19:00 Uhr. Im **Tagesmarkt** braucht jedes Szenario einen eigenen Liefertag.
 Die genutzten Viertelstunden sollten leer sein, am besten einen eigenen Testmarkt nehmen (Feld „Liefertage für
 Szenarien“). Mit Admin-Key legt EGSim fehlende Szenario-EGs selbst an. Ohne Admin-Key braucht es so viele EGs mit
 Zugangsdaten, wie die UI anzeigt (maximal vier).
@@ -95,6 +104,30 @@ Nicht vom Simulator auslösbar ist alles, was eure Plattform entscheidet: Reserv
 Settlement schlägt fehl (`FAILED`), Token läuft nach einer Stunde ab. Das testet ihr mit Testeinstellungen in der
 Plattform. EGSim prüft dann, ob Zuteilungen und Trades dazu passen.
 
+## Schema-Prüfung
+
+Jede Antwort der Plattform wird gegen die Schemas des Datenvertrags geprüft (`contract/Datenvertrag.yaml`, daraus
+erzeugt als `egsim/contract.json`): Pflichtfelder, Typen (eine Zahl als String `"10"` fällt auf), Wertebereiche,
+Nachkommastellen, Formate (UUID, Datum, RFC-3339-Zeitstempel, `intervalStart` nur voll auf der Viertelstunde in UTC),
+erlaubte Enum-Werte und das Fehlerformat (`code` aus der Liste des Vertrags, `message`, `details`). Außerdem:
+
+- Antworten müssen JSON mit `Content-Type: application/json` sein, `204` hat keinen Body.
+- Ein Statuscode, der für den Endpoint nicht im Vertrag steht, ist eine Warnung (401, 403 und 500 gelten überall).
+- Passwörter, API-Keys und Hashes dürfen nur in der Antwort von `POST /energy-communities/{id}/credentials` stehen,
+  das Token nur im Login.
+
+Abweichungen stehen im Bericht als Befund mit Bereich `contract` (je Endpoint, Status und Meldung einmal, mit Anzahl)
+und in `contractIssues`. Ausschalten: `run.validateSchema = false` bzw. in der UI „Schema-Prüfung“.
+
+Neue Vertragsversion: YAML in `contract/` ersetzen und `python tools/gen_contract.py --check` ausführen (braucht
+PyYAML, nur für Entwickler). Das Skript prüft dabei auch, ob alle Beispiele des Vertrags zu seinen Schemas passen.
+
+**Bekannter Fehler im Vertrag 0.2:** `totalOfferedKwh`, `tradableOfferedKwh`, `totalDemandKwh`, `totalPurchasedKwh`,
+`totalSoldKwh` (Tagesergebnis und Intervalle) und `reserve.requiredKwh`/`dispatchedKwh` nutzen das Schema
+`QuantityKwhNonNegative` mit `maximum: 1000000`. Das ist die Grenze einer einzelnen Position, Tagessummen dürfen sie
+überschreiten (SZ-09 reicht allein 1.000.000 kWh ein). Der Prüfer lässt für diese Felder das Maximum weg
+(`KNOWN_CONTRACT_ISSUES` in `egsim/contract.py`). Im Vertrag sollte ein eigenes Summenschema ohne Maximum stehen.
+
 ## Ergebnisprüfung
 
 - **Immer (EG-Sicht):** Mandantentrennung, Positionsstatus nach dem Settlement, genau eine Zuteilung je Position,
@@ -102,6 +135,10 @@ Plattform. EGSim prüft dann, ob Zuteilungen und Trades dazu passen.
   Teilzuteilung pro rata über alle simulierten EGs.
 - **Mit Admin-Key:** Alle Positionen des Markts werden komplett nachgerechnet und mit `/allocations`, `/trades` und
   dem Tagesergebnis `/result` verglichen, inklusive Reserve und Marge, bei 15 Minuten auch je Intervall.
+  Doppelte Handelsabschlüsse (gleiche Position, Richtung und Reserveanteil oder gleiche Trade-ID) fallen auf.
+- **Marktzustand nach dem Settlement:** `SETTLED` mit `closedAt` und `settledAt` (nicht davor), `failureReason` leer,
+  `resolution`, `closesAt` und die drei Preise unverändert gegenüber dem Start, `/result` zeigt dieselben Preise.
+- **Positionen:** `rejectionReason` nur bei `REJECTED` und dann `ENERGY_COMMUNITY_NOT_ACTIVE`.
 - **Ohne Admin, „Nur simulierte EGs am Markt“:** Komplette Nachrechnung aus den Daten der simulierten EGs.
 
 ## Negativtests
@@ -114,7 +151,11 @@ Plattform. EGSim prüft dann, ob Zuteilungen und Trades dazu passen.
 | `VAL`, `INT` | Grenzen und Nachkommastellen, Typen, Datumsformat, unbekannte Felder, kaputtes JSON, `intervalStart` |
 | `NF`, `STATE`, `POS`, `PROF` | 400/404-Codes, doppelte Position, `MARKET_NOT_SETTLED`, `POSITION_NOT_MODIFIABLE` |
 | `CLOSED` | nach Marktschluss: Einreichen/Ändern/Stornieren → 409, Position `PROCESSED` |
-| `ADM` (Admin) | Statusübergänge, PENDING/gesperrte EG → 403, neue Zugangsdaten machen alte ungültig, Löschen (204/409), Markt-Schließen idempotent |
+| `CLOSES` | `closesAt` erreicht, Markt noch `OPEN` (Betreiber schließt später): Einreichen/Ändern/Stornieren → 409 `MARKET_CLOSED`. Läuft, wenn der Simulator auf den Marktschluss wartet |
+| `POS` (PUT) | `quantityKwh` 0 oder mit 4 Nachkommastellen, Preis mit 6 Stellen oder negativ, Bedarf mit Preisvorstellung → 400 |
+| `FIL` | Filter `type`, `status`, `energyCommunityId`, `intervalStart`, `direction`, `positionId` wirken (auch die Gegenprobe), ungültige Filterwerte → 400 (vor 409) |
+| `NF-07` | Position für einen Liefertag ohne Markt → 404 `MARKET_NOT_FOUND` |
+| `ADM` (Admin) | Statusübergänge, PENDING/gesperrte EG → 403 auch bei Positionen einreichen/ändern/stornieren/auflisten, neue Zugangsdaten machen alte API-Keys **und Tokens** ungültig, Löschen (204/409), Admin sieht fremde Positionen und EGs, Markt-Schließen idempotent (Zuteilungen und Trades bleiben gleich) und auch bei 4 gleichzeitigen Aufrufen |
 | `REG` (optional) | Registrierung mit ungültigen Daten → 400, doppelte E-Mail → 409 |
 
 ## Hosten
@@ -145,6 +186,7 @@ Ohne Docker: Mit `EGSIM_UI_PASSWORD=… egsim ui --host 0.0.0.0` ist die UI auch
 ```bash
 egsim run -c egsim-ui.json                     # Lauf mit der gespeicherten UI-Konfiguration
 egsim run -c egsim-ui.json --close             # Markt per Admin-Key selbst schließen
+                                               # (run.parallelClose = 5 in der JSON: 5 gleichzeitige close-Aufrufe)
 egsim run -c egsim-ui.json --scenarios         # ausgewählte Szenarien (oder --scenarios SZ-01,SZ-04)
 egsim run -c egsim-ui.json --wait 30           # bis zu 30 min auf das Settlement warten
 egsim run -c egsim-ui.json --verify-only       # nur Ergebnisse prüfen
@@ -180,6 +222,10 @@ egsim/
   config.py       Konfiguration (JSON)
   client.py       HTTP-Client, Request-Log
   mockserver.py   In-Memory-Mock der API
+  contract.py     Schema-Prüfer für Antworten (ohne Zusatzabhängigkeit), liest contract.json
+  contract.json   Schemas und Antworten des Vertrags, erzeugt aus contract/Datenvertrag.yaml
+contract/         Datenvertrag.yaml (Quelle der Schemas)
+tools/            gen_contract.py (YAML → contract.json, nur für Entwickler)
 deploy/           Caddyfile, .env-Vorlage, Kubernetes-Manifest
 tests/            pytest: Vertragsbeispiele, Profile/Config, Ende-zu-Ende gegen Mock inkl. Szenarien und fehlerhafter Plattformen
 ```

@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from egsim.settlement import STEP, ZERO, D, Pos, Prices, round_eur, settle
-from egsim.timeutil import normalize_interval
+from egsim.timeutil import normalize_interval, parse_ts
 
 if TYPE_CHECKING:
     from egsim.simulator import MarketRun, Simulator
@@ -31,6 +31,7 @@ class Diff:
         self.delivery = delivery
         self.count = 0
         self.compared = 0
+        self.market_final: dict | None = None  # GET /markets/{d} nach dem Settlement
 
     def num(self, where: str, field: str, expected: Any, actual: Any, tol: Decimal = ZERO) -> None:
         self.compared += 1
@@ -76,6 +77,51 @@ def _decimals(v) -> int:
     return -exp if isinstance(exp, int) and exp < 0 else 0
 
 
+def _check_rejection_reason(diff: Diff, where: str, p: dict) -> None:
+    """rejectionReason ist nur bei REJECTED gesetzt, und zwar mit dem Grund ENERGY_COMMUNITY_NOT_ACTIVE."""
+    reason = p.get("rejectionReason")
+    if p.get("status") == "REJECTED":
+        diff.true(where, reason == "ENERGY_COMMUNITY_NOT_ACTIVE",
+                  f"Status REJECTED, rejectionReason {reason!r} (erwartet ENERGY_COMMUNITY_NOT_ACTIVE)")
+    else:
+        diff.true(where, reason is None, f"rejectionReason {reason!r} gesetzt, obwohl der Status {p.get('status')} ist")
+
+
+def _check_market_state(sim: "Simulator", run: "MarketRun", diff: Diff) -> dict | None:
+    """Marktzustand nach dem Settlement: Zeitstempel gesetzt, kein failureReason, Preise und Auflösung unverändert."""
+    reader = sim.reader()
+    if reader is None:
+        return None
+    r = reader.get_market(run.delivery_date)
+    if r.status != 200 or not isinstance(r.body, dict):
+        diff.fail("Markt nach Settlement", f"GET /markets/{run.delivery_date}: HTTP {r.status}")
+        return None
+    fin, start, w = r.body, run.market or {}, "Markt nach Settlement"
+    diff.eq(w, "status", "SETTLED", fin.get("status"))
+    diff.true(w, fin.get("closedAt") is not None, "closedAt fehlt bei Status SETTLED")
+    diff.true(w, fin.get("settledAt") is not None, "settledAt fehlt bei Status SETTLED")
+    diff.true(w, fin.get("failureReason") is None, f"failureReason ist gesetzt ({fin.get('failureReason')!r}), "
+                                                   "gilt aber nur bei FAILED")
+    try:
+        if fin.get("closedAt") and fin.get("settledAt"):
+            diff.true(w, parse_ts(fin["closedAt"]) <= parse_ts(fin["settledAt"]), "closedAt liegt nach settledAt")
+    except (TypeError, ValueError, AttributeError):
+        pass  # ungültige Zeitstempel meldet die Schema-Prüfung
+    if start.get("resolution") is not None:
+        diff.eq(w, "resolution", start.get("resolution"), fin.get("resolution"))
+    try:  # der Vertrag erklärt nur Preise und Auflösung für fest, die Frist darf der Betreiber verschieben: nur Hinweis
+        if start.get("closesAt") and fin.get("closesAt") and parse_ts(start["closesAt"]) != parse_ts(fin["closesAt"]):
+            sim.findings.warning("verify", f"{run.delivery_date}: closesAt hat sich seit dem Start geändert "
+                                           f"({start['closesAt']} → {fin['closesAt']})")
+    except (TypeError, ValueError, AttributeError):
+        pass
+    sp, fp = start.get("prices") or {}, fin.get("prices") or {}
+    for f in ("buyPriceEurPerKwh", "sellPriceEurPerKwh", "reservePriceEurPerKwh"):
+        if f in sp:
+            diff.num(w, f"prices.{f} (bleibt bis zum Settlement unverändert)", sp.get(f), fp.get(f))
+    return fin
+
+
 def verify_market(sim: "Simulator", run: "MarketRun") -> dict:
     d = run.delivery_date
     diff = Diff(sim, d)
@@ -90,6 +136,7 @@ def verify_market(sim: "Simulator", run: "MarketRun") -> dict:
     all_trades: list[dict] = []
     by_status: dict[str, int] = defaultdict(int)
     tracked = {sp.id: sp for sp in run.positions if sp.id}
+    diff.market_final = _check_market_state(sim, run, diff)
 
     for eg in sim.egs:
         if not eg.ready:
@@ -109,6 +156,7 @@ def verify_market(sim: "Simulator", run: "MarketRun") -> dict:
             by_status[p.get("status")] += 1
             diff.true(f"{who} Position {p['id']}", p.get("status") not in ("OPEN", "CLOSED"),
                       f"Status {p.get('status')} nach SETTLED (erwartet PROCESSED/CANCELLED/REJECTED)")
+            _check_rejection_reason(diff, f"{who} Position {p['id']}", p)
             sp = tracked.get(p["id"])
             if sp:
                 diff.eq(f"{who} Position {p['id']}", "status", "CANCELLED" if sp.cancelled else "PROCESSED", p.get("status"))
@@ -270,6 +318,7 @@ def _full_recalc(diff: Diff, d, resolution, prices, all_pos, all_alloc, all_trad
         diff.num(w, "allocatedKwh", ra.allocated, pa.get("allocatedKwh"), tol_k)
         diff.eq(w, "reason", ra.reason, pa.get("reason"))
     plat = {(t.get("positionId"), t.get("direction"), bool(t.get("fromReserve"))): t for t in all_trades}
+    diff.true(f"Nachrechnung {d}", len(plat) == len(all_trades), "doppelte Handelsabschlüsse")
     refk = {(t.position.id, t.direction, t.from_reserve): t for t in ref.trades}
     for k, rt in refk.items():
         pt = plat.get(k)
@@ -311,6 +360,16 @@ def verify_market_admin(sim: "Simulator", run: "MarketRun", diff: Diff) -> dict 
     for p in positions:
         diff.true(f"Admin: Position {p.get('id')}", p.get("status") not in ("OPEN", "CLOSED"),
                   f"Status {p.get('status')} nach SETTLED")
+        _check_rejection_reason(diff, f"Admin: Position {p.get('id')}", p)
+    fin = diff.market_final or {}
+    for f in ("buyPriceEurPerKwh", "sellPriceEurPerKwh", "reservePriceEurPerKwh"):
+        if f in (fin.get("prices") or {}):
+            diff.num("Admin: Tagesergebnis", f"prices.{f} (wie im Markt)", fin["prices"][f], (result.get("prices") or {}).get(f))
+    try:
+        if fin.get("settledAt") and result.get("settledAt"):
+            diff.eq("Admin: Tagesergebnis", "settledAt (wie im Markt)", parse_ts(fin["settledAt"]), parse_ts(result["settledAt"]))
+    except (TypeError, ValueError, AttributeError):
+        pass
 
     processed = [Pos.from_api(p) for p in positions if p.get("status") == "PROCESSED"]
     if resolution == "QUARTER_HOUR":
@@ -335,6 +394,9 @@ def verify_market_admin(sim: "Simulator", run: "MarketRun", diff: Diff) -> dict 
         diff.fail(f"Admin: Zuteilung {pid}", "gehört zu keiner PROCESSED-Position")
 
     plat_tr = {(t.get("positionId"), t.get("direction"), bool(t.get("fromReserve"))): t for t in trades}
+    diff.true("Admin: Trades", len(plat_tr) == len(trades),
+              "doppelte Handelsabschlüsse (gleiche positionId, direction und fromReserve mehrfach)")
+    diff.true("Admin: Trades", len({t.get("id") for t in trades}) == len(trades), "Trade-IDs nicht eindeutig")
     ref_tr = {(t.position.id, t.direction, t.from_reserve): t for t in ref.trades}
     for k, rt in ref_tr.items():
         pt = plat_tr.get(k)

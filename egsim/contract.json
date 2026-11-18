@@ -1,0 +1,1437 @@
+{
+ "operations": {
+  "DELETE /energy-communities/{id}": {
+   "public": false,
+   "responses": {
+    "204": null,
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN"
+   ]
+  },
+  "DELETE /positions/{id}": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/Position"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "GET /energy-communities": {
+   "public": false,
+   "responses": {
+    "200": {
+     "items": {
+      "$ref": "#/components/schemas/EnergyCommunity"
+     },
+     "type": "array"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN"
+   ]
+  },
+  "GET /energy-communities/{id}": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/EnergyCommunity"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "GET /health/live": {
+   "public": true,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/Health"
+    }
+   },
+   "roles": []
+  },
+  "GET /health/ready": {
+   "public": true,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/Health"
+    },
+    "503": {
+     "$ref": "#/components/schemas/Health"
+    }
+   },
+   "roles": []
+  },
+  "GET /markets/{deliveryDate}": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/Market"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "GET /markets/{deliveryDate}/allocations": {
+   "public": false,
+   "responses": {
+    "200": {
+     "items": {
+      "$ref": "#/components/schemas/Allocation"
+     },
+     "type": "array"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "GET /markets/{deliveryDate}/result": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/MarketResult"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN"
+   ]
+  },
+  "GET /markets/{deliveryDate}/trades": {
+   "public": false,
+   "responses": {
+    "200": {
+     "items": {
+      "$ref": "#/components/schemas/Trade"
+     },
+     "type": "array"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "GET /me": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/Me"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "GET /positions": {
+   "public": false,
+   "responses": {
+    "200": {
+     "items": {
+      "$ref": "#/components/schemas/Position"
+     },
+     "type": "array"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "GET /positions/{id}": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/Position"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "POST /auth/login": {
+   "public": true,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/LoginResponse"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": []
+  },
+  "POST /auth/logout": {
+   "public": false,
+   "responses": {
+    "204": null,
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "POST /energy-communities": {
+   "public": true,
+   "responses": {
+    "201": {
+     "$ref": "#/components/schemas/EnergyCommunity"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": []
+  },
+  "POST /energy-communities/{id}/credentials": {
+   "public": false,
+   "responses": {
+    "201": {
+     "$ref": "#/components/schemas/Credentials"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN"
+   ]
+  },
+  "POST /markets/{deliveryDate}/close": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/Market"
+    },
+    "202": {
+     "$ref": "#/components/schemas/Market"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN"
+   ]
+  },
+  "POST /positions": {
+   "public": false,
+   "responses": {
+    "201": {
+     "$ref": "#/components/schemas/Position"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "422": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "PUT /energy-communities/{id}": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/EnergyCommunity"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
+  "PUT /energy-communities/{id}/status": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/EnergyCommunity"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN"
+   ]
+  },
+  "PUT /positions/{id}": {
+   "public": false,
+   "responses": {
+    "200": {
+     "$ref": "#/components/schemas/Position"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "404": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ENERGY_COMMUNITY"
+   ]
+  }
+ },
+ "schemas": {
+  "Allocation": {
+   "properties": {
+    "allocatedKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "energyCommunityId": {
+     "$ref": "#/components/schemas/EnergyCommunityId"
+    },
+    "intervalStart": {
+     "$ref": "#/components/schemas/IntervalStartOrNull"
+    },
+    "positionId": {
+     "$ref": "#/components/schemas/PositionId"
+    },
+    "reason": {
+     "$ref": "#/components/schemas/AllocationReason"
+    },
+    "requestedKwh": {
+     "$ref": "#/components/schemas/QuantityKwh"
+    },
+    "type": {
+     "$ref": "#/components/schemas/PositionType"
+    }
+   },
+   "required": [
+    "deliveryDate",
+    "intervalStart",
+    "positionId",
+    "energyCommunityId",
+    "type",
+    "requestedKwh",
+    "allocatedKwh",
+    "reason"
+   ],
+   "type": "object"
+  },
+  "AllocationReason": {
+   "description": "Warum die Zuteilung so ausfällt (Vorschlag). FULLY_ALLOCATED: volle Menge. PARTIALLY_ALLOCATED: Angebot pro rata gekürzt, weil handelbare Angebote den Bedarf übersteigen. PRICE_NOT_MET: Preisvorstellung über buyPriceEurPerKwh, nicht gehandelt. NOT_NEEDED: kein Bedarf vorhanden. RESERVE_SHORTAGE: Bedarf gekürzt, weil die Reserve nicht reicht.",
+   "enum": [
+    "FULLY_ALLOCATED",
+    "PARTIALLY_ALLOCATED",
+    "PRICE_NOT_MET",
+    "NOT_NEEDED",
+    "RESERVE_SHORTAGE"
+   ],
+   "type": "string"
+  },
+  "AmountEur": {
+   "type": "number",
+   "x-maxDecimals": 2
+  },
+  "Credentials": {
+   "properties": {
+    "apiKey": {
+     "type": "string"
+    },
+    "password": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "apiKey",
+    "password"
+   ],
+   "type": "object"
+  },
+  "DeliveryDate": {
+   "examples": [
+    "2026-11-20"
+   ],
+   "format": "date",
+   "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+   "type": "string"
+  },
+  "EnergyCommunity": {
+   "properties": {
+    "createdAt": {
+     "$ref": "#/components/schemas/Timestamp"
+    },
+    "description": {
+     "type": "string"
+    },
+    "email": {
+     "format": "email",
+     "maxLength": 254,
+     "type": "string"
+    },
+    "id": {
+     "$ref": "#/components/schemas/EnergyCommunityId"
+    },
+    "name": {
+     "type": "string"
+    },
+    "status": {
+     "$ref": "#/components/schemas/EnergyCommunityStatus"
+    },
+    "updatedAt": {
+     "$ref": "#/components/schemas/Timestamp"
+    }
+   },
+   "required": [
+    "id",
+    "email",
+    "name",
+    "status",
+    "createdAt",
+    "updatedAt"
+   ],
+   "type": "object"
+  },
+  "EnergyCommunityId": {
+   "examples": [
+    "3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10"
+   ],
+   "format": "uuid",
+   "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+   "type": "string"
+  },
+  "EnergyCommunityRegistration": {
+   "additionalProperties": false,
+   "properties": {
+    "description": {
+     "maxLength": 500,
+     "minLength": 1,
+     "type": "string"
+    },
+    "email": {
+     "format": "email",
+     "maxLength": 254,
+     "type": "string"
+    },
+    "name": {
+     "maxLength": 120,
+     "minLength": 1,
+     "pattern": "\\S",
+     "type": "string"
+    }
+   },
+   "required": [
+    "email",
+    "name"
+   ],
+   "type": "object"
+  },
+  "EnergyCommunityStatus": {
+   "enum": [
+    "PENDING",
+    "ACTIVE",
+    "SUSPENDED"
+   ],
+   "type": "string"
+  },
+  "EnergyCommunityStatusUpdate": {
+   "additionalProperties": false,
+   "properties": {
+    "status": {
+     "$ref": "#/components/schemas/EnergyCommunityStatus"
+    }
+   },
+   "required": [
+    "status"
+   ],
+   "type": "object"
+  },
+  "EnergyCommunityUpdate": {
+   "additionalProperties": false,
+   "description": "Profil bearbeiten. Der Status ist hier nicht erlaubt (nur PUT /energy-communities/{id}/status).",
+   "minProperties": 1,
+   "properties": {
+    "description": {
+     "maxLength": 500,
+     "minLength": 1,
+     "type": "string"
+    },
+    "name": {
+     "maxLength": 120,
+     "minLength": 1,
+     "pattern": "\\S",
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "Error": {
+   "properties": {
+    "code": {
+     "$ref": "#/components/schemas/ErrorCode"
+    },
+    "details": {
+     "items": {
+      "properties": {
+       "code": {
+        "$ref": "#/components/schemas/ErrorCode"
+       },
+       "field": {
+        "examples": [
+         "/quantityKwh"
+        ],
+        "type": "string"
+       },
+       "message": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "field",
+       "message"
+      ],
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "message": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "code",
+    "message"
+   ],
+   "type": "object"
+  },
+  "ErrorCode": {
+   "enum": [
+    "VALIDATION_FAILED",
+    "INVALID_ID",
+    "INVALID_DELIVERY_DATE",
+    "INVALID_INTERVAL",
+    "INVALID_POSITION_TYPE",
+    "INVALID_QUANTITY",
+    "INVALID_PRICE",
+    "UNAUTHORIZED",
+    "INVALID_CREDENTIALS",
+    "FORBIDDEN",
+    "ENERGY_COMMUNITY_NOT_ACTIVE",
+    "ENERGY_COMMUNITY_NOT_FOUND",
+    "POSITION_NOT_FOUND",
+    "MARKET_NOT_FOUND",
+    "EMAIL_ALREADY_REGISTERED",
+    "ENERGY_COMMUNITY_IN_USE",
+    "INVALID_STATUS_TRANSITION",
+    "POSITION_ALREADY_EXISTS",
+    "POSITION_NOT_MODIFIABLE",
+    "MARKET_CLOSED",
+    "MARKET_NOT_SETTLED",
+    "DELIVERY_DATE_IN_PAST",
+    "INTERNAL_ERROR"
+   ],
+   "type": "string"
+  },
+  "Health": {
+   "properties": {
+    "checks": {
+     "additionalProperties": {
+      "enum": [
+       "UP",
+       "DOWN"
+      ],
+      "type": "string"
+     },
+     "examples": [
+      {
+       "database": "UP"
+      }
+     ],
+     "type": "object"
+    },
+    "status": {
+     "enum": [
+      "UP",
+      "DOWN"
+     ],
+     "type": "string"
+    }
+   },
+   "required": [
+    "status"
+   ],
+   "type": "object"
+  },
+  "IntervalResult": {
+   "properties": {
+    "intervalStart": {
+     "$ref": "#/components/schemas/IntervalStart"
+    },
+    "reserve": {
+     "$ref": "#/components/schemas/Reserve"
+    },
+    "totalDemandKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "totalOfferedKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "totalPurchasedKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "totalSoldKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "tradableOfferedKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    }
+   },
+   "required": [
+    "intervalStart",
+    "totalOfferedKwh",
+    "tradableOfferedKwh",
+    "totalDemandKwh",
+    "totalPurchasedKwh",
+    "totalSoldKwh",
+    "reserve"
+   ],
+   "type": "object"
+  },
+  "IntervalStart": {
+   "description": "Beginn des 15-Minuten-Intervalls in UTC (nur bei QUARTER_HOUR).",
+   "examples": [
+    "2026-11-20T11:15:00Z"
+   ],
+   "format": "date-time",
+   "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:(00|15|30|45):00(\\.0+)?Z$",
+   "type": "string"
+  },
+  "IntervalStartOrNull": {
+   "description": "Beginn des Lieferintervalls; null im Tagesmarkt (DAY).",
+   "oneOf": [
+    {
+     "$ref": "#/components/schemas/IntervalStart"
+    },
+    {
+     "type": "null"
+    }
+   ]
+  },
+  "LoginRequest": {
+   "additionalProperties": false,
+   "properties": {
+    "email": {
+     "format": "email",
+     "maxLength": 254,
+     "type": "string"
+    },
+    "password": {
+     "maxLength": 128,
+     "minLength": 1,
+     "type": "string"
+    }
+   },
+   "required": [
+    "email",
+    "password"
+   ],
+   "type": "object"
+  },
+  "LoginResponse": {
+   "properties": {
+    "energyCommunity": {
+     "$ref": "#/components/schemas/EnergyCommunity"
+    },
+    "expiresIn": {
+     "description": "Gültigkeit in Sekunden",
+     "minimum": 1,
+     "type": "integer"
+    },
+    "role": {
+     "enum": [
+      "ADMIN",
+      "ENERGY_COMMUNITY"
+     ],
+     "type": "string"
+    },
+    "token": {
+     "type": "string"
+    },
+    "tokenType": {
+     "const": "Bearer",
+     "type": "string"
+    }
+   },
+   "required": [
+    "token",
+    "tokenType",
+    "expiresIn",
+    "role"
+   ],
+   "type": "object"
+  },
+  "Market": {
+   "properties": {
+    "closedAt": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/Timestamp"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "closesAt": {
+     "$ref": "#/components/schemas/Timestamp",
+     "description": "Ab diesem Zeitpunkt werden keine Positionen mehr angenommen, geändert oder storniert."
+    },
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "failureReason": {
+     "description": "Nur bei FAILED gesetzt.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "prices": {
+     "$ref": "#/components/schemas/Prices",
+     "description": "Ab Marktöffnung bekannt und bis zum Settlement unverändert (Vorschlag)."
+    },
+    "resolution": {
+     "$ref": "#/components/schemas/MarketResolution"
+    },
+    "settledAt": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/Timestamp"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "status": {
+     "$ref": "#/components/schemas/MarketStatus"
+    }
+   },
+   "required": [
+    "deliveryDate",
+    "resolution",
+    "status",
+    "prices",
+    "closesAt"
+   ],
+   "type": "object"
+  },
+  "MarketResolution": {
+   "description": "Zeitliche Auflösung des Markts (Vorschlag). DAY = ein Intervall pro Liefertag, QUARTER_HOUR = 15-Minuten-Intervalle.",
+   "enum": [
+    "DAY",
+    "QUARTER_HOUR"
+   ],
+   "type": "string"
+  },
+  "MarketResult": {
+   "properties": {
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "intervals": {
+     "description": "Nur bei QUARTER_HOUR: Ergebnis je Intervall. Die Felder auf oberster Ebene sind die Tagessummen.",
+     "items": {
+      "$ref": "#/components/schemas/IntervalResult"
+     },
+     "type": "array"
+    },
+    "marginEur": {
+     "$ref": "#/components/schemas/AmountEur",
+     "description": "salesRevenueEur - purchaseCostEur - reserve.costEur"
+    },
+    "prices": {
+     "$ref": "#/components/schemas/Prices"
+    },
+    "purchaseCostEur": {
+     "$ref": "#/components/schemas/AmountEur"
+    },
+    "reserve": {
+     "$ref": "#/components/schemas/Reserve"
+    },
+    "resolution": {
+     "$ref": "#/components/schemas/MarketResolution"
+    },
+    "salesRevenueEur": {
+     "$ref": "#/components/schemas/AmountEur"
+    },
+    "settledAt": {
+     "$ref": "#/components/schemas/Timestamp"
+    },
+    "status": {
+     "$ref": "#/components/schemas/MarketStatus"
+    },
+    "totalDemandKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "totalOfferedKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "totalPurchasedKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "totalSoldKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "tradableOfferedKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative",
+     "description": "Summe der Angebote, deren Preisvorstellung erfüllt ist (S)."
+    }
+   },
+   "required": [
+    "deliveryDate",
+    "resolution",
+    "status",
+    "settledAt",
+    "totalOfferedKwh",
+    "tradableOfferedKwh",
+    "totalDemandKwh",
+    "totalPurchasedKwh",
+    "totalSoldKwh",
+    "reserve",
+    "prices",
+    "purchaseCostEur",
+    "salesRevenueEur",
+    "marginEur"
+   ],
+   "type": "object"
+  },
+  "MarketStatus": {
+   "enum": [
+    "OPEN",
+    "CLOSED",
+    "SETTLED",
+    "FAILED"
+   ],
+   "type": "string"
+  },
+  "Me": {
+   "properties": {
+    "energyCommunity": {
+     "$ref": "#/components/schemas/EnergyCommunity"
+    },
+    "role": {
+     "enum": [
+      "ADMIN",
+      "ENERGY_COMMUNITY"
+     ],
+     "type": "string"
+    }
+   },
+   "required": [
+    "role"
+   ],
+   "type": "object"
+  },
+  "Position": {
+   "properties": {
+    "createdAt": {
+     "$ref": "#/components/schemas/Timestamp"
+    },
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "energyCommunityId": {
+     "$ref": "#/components/schemas/EnergyCommunityId"
+    },
+    "id": {
+     "$ref": "#/components/schemas/PositionId"
+    },
+    "intervalStart": {
+     "$ref": "#/components/schemas/IntervalStartOrNull"
+    },
+    "priceExpectationEurPerKwh": {
+     "$ref": "#/components/schemas/PriceEurPerKwh"
+    },
+    "quantityKwh": {
+     "$ref": "#/components/schemas/QuantityKwh"
+    },
+    "rejectionReason": {
+     "description": "Nur bei REJECTED gesetzt, z. B. ENERGY_COMMUNITY_NOT_ACTIVE.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "status": {
+     "$ref": "#/components/schemas/PositionStatus"
+    },
+    "type": {
+     "$ref": "#/components/schemas/PositionType"
+    },
+    "updatedAt": {
+     "$ref": "#/components/schemas/Timestamp"
+    }
+   },
+   "required": [
+    "id",
+    "energyCommunityId",
+    "deliveryDate",
+    "intervalStart",
+    "type",
+    "quantityKwh",
+    "status",
+    "createdAt",
+    "updatedAt"
+   ],
+   "type": "object"
+  },
+  "PositionId": {
+   "examples": [
+    "6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234"
+   ],
+   "format": "uuid",
+   "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+   "type": "string"
+  },
+  "PositionRequest": {
+   "additionalProperties": false,
+   "if": {
+    "properties": {
+     "type": {
+      "const": "DEMAND"
+     }
+    },
+    "required": [
+     "type"
+    ]
+   },
+   "properties": {
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "energyCommunityId": {
+     "$ref": "#/components/schemas/EnergyCommunityId",
+     "description": "Optional. Der Server setzt die ID der angemeldeten EG ein. Eine fremde ID ergibt 403 FORBIDDEN."
+    },
+    "intervalStart": {
+     "$ref": "#/components/schemas/IntervalStart",
+     "description": "Nur bei QUARTER_HOUR-Märkten, dort Pflicht. Bei DAY-Märkten nicht erlaubt."
+    },
+    "priceExpectationEurPerKwh": {
+     "$ref": "#/components/schemas/PriceEurPerKwh",
+     "description": "Nur bei OFFER: Mindestpreis, zu dem die EG verkauft. Liegt er über buyPriceEurPerKwh, wird das Angebot nicht gehandelt."
+    },
+    "quantityKwh": {
+     "$ref": "#/components/schemas/QuantityKwh"
+    },
+    "type": {
+     "$ref": "#/components/schemas/PositionType"
+    }
+   },
+   "required": [
+    "deliveryDate",
+    "type",
+    "quantityKwh"
+   ],
+   "then": {
+    "not": {
+     "required": [
+      "priceExpectationEurPerKwh"
+     ]
+    }
+   },
+   "type": "object"
+  },
+  "PositionStatus": {
+   "enum": [
+    "OPEN",
+    "CANCELLED",
+    "CLOSED",
+    "PROCESSED",
+    "REJECTED"
+   ],
+   "type": "string"
+  },
+  "PositionType": {
+   "enum": [
+    "OFFER",
+    "DEMAND"
+   ],
+   "type": "string"
+  },
+  "PositionUpdate": {
+   "additionalProperties": false,
+   "properties": {
+    "priceExpectationEurPerKwh": {
+     "$ref": "#/components/schemas/PriceEurPerKwh"
+    },
+    "quantityKwh": {
+     "$ref": "#/components/schemas/QuantityKwh"
+    }
+   },
+   "required": [
+    "quantityKwh"
+   ],
+   "type": "object"
+  },
+  "PriceEurPerKwh": {
+   "examples": [
+    0.1
+   ],
+   "maximum": 100,
+   "minimum": 0,
+   "type": "number",
+   "x-maxDecimals": 5
+  },
+  "Prices": {
+   "properties": {
+    "buyPriceEurPerKwh": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/PriceEurPerKwh"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "reservePriceEurPerKwh": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/PriceEurPerKwh"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "sellPriceEurPerKwh": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/PriceEurPerKwh"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "deliveryDate",
+    "buyPriceEurPerKwh",
+    "sellPriceEurPerKwh"
+   ],
+   "type": "object"
+  },
+  "QuantityKwh": {
+   "examples": [
+    120.5
+   ],
+   "exclusiveMinimum": 0,
+   "maximum": 1000000,
+   "type": "number",
+   "x-maxDecimals": 3
+  },
+  "QuantityKwhNonNegative": {
+   "maximum": 1000000,
+   "minimum": 0,
+   "type": "number",
+   "x-maxDecimals": 3
+  },
+  "Reserve": {
+   "properties": {
+    "costEur": {
+     "$ref": "#/components/schemas/AmountEur"
+    },
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "dispatchedKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+    },
+    "priceEurPerKwh": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/PriceEurPerKwh"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "requiredKwh": {
+     "$ref": "#/components/schemas/QuantityKwhNonNegative",
+     "description": "max(D - S, 0), S = Summe der handelbaren Angebote."
+    },
+    "status": {
+     "$ref": "#/components/schemas/ReserveStatus"
+    }
+   },
+   "required": [
+    "deliveryDate",
+    "status",
+    "requiredKwh",
+    "dispatchedKwh",
+    "costEur"
+   ],
+   "type": "object"
+  },
+  "ReserveStatus": {
+   "enum": [
+    "NOT_NEEDED",
+    "COVERED",
+    "PARTIAL",
+    "UNAVAILABLE"
+   ],
+   "type": "string"
+  },
+  "Timestamp": {
+   "format": "date-time",
+   "type": "string"
+  },
+  "Trade": {
+   "properties": {
+    "amountEur": {
+     "$ref": "#/components/schemas/AmountEur"
+    },
+    "createdAt": {
+     "$ref": "#/components/schemas/Timestamp"
+    },
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "direction": {
+     "$ref": "#/components/schemas/TradeDirection"
+    },
+    "energyCommunityId": {
+     "$ref": "#/components/schemas/EnergyCommunityId"
+    },
+    "fromReserve": {
+     "description": "true, wenn die Menge eines Bedarfs aus der Reserve gedeckt wurde (nur bei PLATFORM_SELLS).",
+     "type": "boolean"
+    },
+    "id": {
+     "$ref": "#/components/schemas/TradeId"
+    },
+    "intervalStart": {
+     "$ref": "#/components/schemas/IntervalStartOrNull"
+    },
+    "positionId": {
+     "$ref": "#/components/schemas/PositionId",
+     "description": "Position, aus der dieser Handelsabschluss entstanden ist."
+    },
+    "priceEurPerKwh": {
+     "$ref": "#/components/schemas/PriceEurPerKwh"
+    },
+    "quantityKwh": {
+     "$ref": "#/components/schemas/QuantityKwh"
+    }
+   },
+   "required": [
+    "id",
+    "deliveryDate",
+    "intervalStart",
+    "positionId",
+    "energyCommunityId",
+    "direction",
+    "fromReserve",
+    "quantityKwh",
+    "priceEurPerKwh",
+    "amountEur",
+    "createdAt"
+   ],
+   "type": "object"
+  },
+  "TradeDirection": {
+   "enum": [
+    "PLATFORM_BUYS",
+    "PLATFORM_SELLS"
+   ],
+   "type": "string"
+  },
+  "TradeId": {
+   "examples": [
+    "9d2e7a41-0c55-4b8e-9a3f-52c1d8e4f7b6"
+   ],
+   "format": "uuid",
+   "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+   "type": "string"
+  }
+ },
+ "version": "0.2.0"
+}

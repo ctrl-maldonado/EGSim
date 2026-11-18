@@ -106,6 +106,7 @@ class Config:
     admin_password: str | None = None
     auto_provision: bool = True
     close_market: bool = False
+    parallel_close: int = 1        # > 1: Marktschluss mit so vielen gleichzeitigen close-Aufrufen
     admin_checks: bool = True
     scenarios: list[str] = field(default_factory=list)
     scenario_dates: list[str] = field(default_factory=list)
@@ -119,6 +120,7 @@ class Config:
     verify_results: bool = True
     all_participants_simulated: bool = False
     checks: bool = True
+    validate_schema: bool = True
     registration_checks: bool = False
     on_existing_position: str = "skip"
     report_dir: str | None = "reports"
@@ -149,9 +151,9 @@ def default_config_dict() -> dict:
         "run": {
             "seed": 42, "deliveryDates": ["tomorrow"], "concurrency": 4, "delayMs": [0, 0],
             "submitPositions": True, "waitForSettlementMinutes": 0, "verifyResults": True,
-            "allParticipantsSimulated": False, "checks": True, "registrationChecks": False,
+            "allParticipantsSimulated": False, "checks": True, "validateSchema": True, "registrationChecks": False,
             "onExistingPosition": "skip", "reportDir": "reports", "failOnFindings": True,
-            "tolerance": {"kwh": 0, "eur": 0}, "autoProvision": True, "closeMarket": False, "adminChecks": True,
+            "tolerance": {"kwh": 0, "eur": 0}, "autoProvision": True, "closeMarket": False, "parallelClose": 1, "adminChecks": True,
             "scenarios": [], "scenarioDates": [],
         },
         "behaviour": {"updateProbability": 0.2, "updateChangePercent": 20, "cancelProbability": 0.05,
@@ -254,6 +256,7 @@ def parse_config(raw: dict) -> Config:
     cfg.verify_results = bool(run.get("verifyResults", cfg.verify_results))
     cfg.all_participants_simulated = bool(run.get("allParticipantsSimulated", cfg.all_participants_simulated))
     cfg.checks = bool(run.get("checks", cfg.checks))
+    cfg.validate_schema = bool(run.get("validateSchema", cfg.validate_schema))
     cfg.registration_checks = bool(run.get("registrationChecks", cfg.registration_checks))
     cfg.on_existing_position = run.get("onExistingPosition", cfg.on_existing_position)
     if cfg.on_existing_position not in ("skip", "update"):
@@ -262,6 +265,7 @@ def parse_config(raw: dict) -> Config:
     cfg.fail_on_findings = bool(run.get("failOnFindings", cfg.fail_on_findings))
     cfg.auto_provision = bool(run.get("autoProvision", cfg.auto_provision))
     cfg.close_market = bool(run.get("closeMarket", cfg.close_market))
+    cfg.parallel_close = max(1, min(20, int(run.get("parallelClose") or cfg.parallel_close)))
     cfg.admin_checks = bool(run.get("adminChecks", cfg.admin_checks))
     cfg.scenarios = [str(x) for x in (run.get("scenarios") or [])]
     sd = run.get("scenarioDates") or []

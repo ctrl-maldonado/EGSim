@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Callable
@@ -122,6 +123,9 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
           [_err(400, "INVALID_ID")])
     c.run("NF-06", "Ungültiges Datum im Pfad → 400 INVALID_DELIVERY_DATE", lambda: sp_a.eg.client.get_market("20-11-2026"),
           [_err(400, "INVALID_DELIVERY_DATE")])
+    c.run("NF-07", "Position für einen Liefertag ohne Markt → 404 MARKET_NOT_FOUND",
+          lambda: sp_a.eg.client.submit_position({"deliveryDate": "2099-12-31", "type": "DEMAND", "quantityKwh": Decimal(1)}),
+          [_err(404, "MARKET_NOT_FOUND")], on_unexpected_success=_cleanup(sim, sp_a.eg.client))
     c.run("STATE-02", "Zuteilungen vor Settlement → 409 MARKET_NOT_SETTLED", lambda: sp_a.eg.client.allocations(d),
           [_err(409, "MARKET_NOT_SETTLED")])
     c.run("STATE-03", "Trades vor Settlement → 409 MARKET_NOT_SETTLED", lambda: sp_a.eg.client.trades(d),
@@ -167,6 +171,8 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
           lambda: cl.update_community(eg.id, {"description": "Simulierte EG (EGSim), Profil geändert"}), [_err(200)])
     c.run("PROF-03", "Leerer Name → 400 VALIDATION_FAILED", lambda: cl.update_community(eg.id, {"name": "   "}),
           [_err(400, "VALIDATION_FAILED")])
+    c.run("PROF-04", "Eigene EG abrufen → 200", lambda: cl.get_community(eg.id), [_err(200)],
+          extra=lambda r: None if (r.body or {}).get("id") == eg.id else "falsche EG zurückgegeben")
 
     # --- Validierung (Prüfreihenfolge: 400 vor 409)
     offer = base["type"] == "OFFER"
@@ -258,6 +264,9 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
     c.run("TEN-01", "EG-Liste enthält nur eigene Positionen", lambda: cl.list_positions(deliveryDate=d), [_err(200)],
           extra=own_only)
 
+    _put_validation_checks(c, sim, run)
+    _filter_checks_open(c, sim, run, sp_a)
+
     # --- Mandantentrennung (zweite EG nötig)
     if not sp_b:
         c.skip("TEN-02", "Mandantentrennung", "nur eine EG mit offener Position – mindestens zwei EGs konfigurieren")
@@ -295,6 +304,186 @@ class _Drop:
 _DROP = _Drop()
 
 
+def _only(field: str, value, *, must_include: str | None = None) -> Callable[[ApiResponse], str | None]:
+    """Prüfung für Filter: alle Zeilen passen zum Filterwert, optional muss eine bestimmte Position enthalten sein."""
+    def check(r: ApiResponse) -> str | None:
+        rows = r.body if isinstance(r.body, list) else []
+        norm = normalize_interval if field == "intervalStart" else (lambda x: x)
+        bad = [x for x in rows if norm(x.get(field)) != norm(value)]
+        if bad:
+            return f"{len(bad)} von {len(rows)} Einträgen passen nicht zum Filter {field}={value}"
+        if must_include and not any(x.get("id") == must_include for x in rows):
+            return f"Position {must_include} fehlt in der gefilterten Liste"
+        return None
+    return check
+
+
+def _put_validation_checks(c: Checker, sim: "Simulator", run: "MarketRun") -> None:
+    """Menge und Preis werden bei PUT genauso geprüft wie beim Einreichen."""
+    live = [x for x in run.positions if x.id and not x.cancelled and x.status == "OPEN" and x.eg.ready]
+    if not live:
+        return
+
+    def restore(sp: "SubmittedPosition") -> Callable[[ApiResponse], None]:
+        def f(r: ApiResponse) -> None:
+            body = {"quantityKwh": sp.quantity}
+            if sp.price_expectation is not None:
+                body["priceExpectationEurPerKwh"] = sp.price_expectation
+            sp.eg.client.update_position(sp.id, body)
+            sim.findings.warning("check", f"Ungültige Änderung an Position {sp.id} wurde angenommen und zurückgesetzt")
+        return f
+
+    a = live[0]
+    c.run("POS-04", "PUT mit quantityKwh = 0 → 400 INVALID_QUANTITY",
+          lambda: a.eg.client.update_position(a.id, {"quantityKwh": Decimal(0)}), [_err(400, "INVALID_QUANTITY")],
+          on_unexpected_success=restore(a))
+    c.run("POS-05", "PUT mit 4 Nachkommastellen → 400 INVALID_QUANTITY",
+          lambda: a.eg.client.update_position(a.id, {"quantityKwh": Decimal("1.2345")}), [_err(400, "INVALID_QUANTITY")],
+          on_unexpected_success=restore(a))
+    offer = next((x for x in live if x.planned.type == "OFFER"), None)
+    if offer:
+        c.run("POS-06", "PUT mit Preis mit 6 Nachkommastellen → 400 INVALID_PRICE",
+              lambda: offer.eg.client.update_position(offer.id, {"quantityKwh": offer.quantity,
+                                                                 "priceExpectationEurPerKwh": Decimal("0.123456")}),
+              [_err(400, "INVALID_PRICE")], on_unexpected_success=restore(offer))
+        c.run("POS-07", "PUT mit negativem Preis → 400 INVALID_PRICE",
+              lambda: offer.eg.client.update_position(offer.id, {"quantityKwh": offer.quantity,
+                                                                 "priceExpectationEurPerKwh": Decimal("-0.01")}),
+              [_err(400, "INVALID_PRICE")], on_unexpected_success=restore(offer))
+    else:
+        c.skip("POS-06", "PUT mit ungültigem Preis", "kein offenes Angebot vorhanden")
+    demand = next((x for x in live if x.planned.type == "DEMAND"), None)
+    if demand:
+        c.run("POS-08", "PUT eines Bedarfs mit Preisvorstellung → 400 VALIDATION_FAILED",
+              lambda: demand.eg.client.update_position(demand.id, {"quantityKwh": demand.quantity,
+                                                                   "priceExpectationEurPerKwh": Decimal("0.1")}),
+              [_err(400, "VALIDATION_FAILED")], on_unexpected_success=restore(demand))
+    else:
+        c.skip("POS-08", "PUT eines Bedarfs mit Preisvorstellung", "kein offener Bedarf vorhanden")
+
+
+def _filter_checks_open(c: Checker, sim: "Simulator", run: "MarketRun", sp_a: "SubmittedPosition") -> None:
+    """Query-Filter von GET /positions und ungültige Filterwerte aller Listen (400 kommt laut Prüfreihenfolge vor 409)."""
+    d = run.delivery_date
+    eg = sp_a.eg
+    cl = eg.client
+    live = [x for x in run.positions if x.id and not x.cancelled and x.status == "OPEN" and x.eg.ready]
+    offer = next((x for x in live if x.planned.type == "OFFER"), None)
+    if offer:
+        c.run("FIL-01", "Positionen mit type=OFFER → nur Angebote",
+              lambda: offer.eg.client.list_positions(deliveryDate=d, type="OFFER"), [_err(200)],
+              extra=_only("type", "OFFER", must_include=offer.id))
+    # die Gegenprobe trennt: Eine EG hat meist nur Angebote oder nur Bedarfe, ein ignorierter Filter fiele sonst nicht auf
+    opposite = "DEMAND" if sp_a.planned.type == "OFFER" else "OFFER"
+    c.run("FIL-01b", f"Positionen mit type={opposite} → keine Positionen des anderen Typs",
+          lambda: cl.list_positions(deliveryDate=d, type=opposite), [_err(200)], extra=_only("type", opposite))
+    c.run("FIL-02", "Positionen mit status=OPEN → nur offene", lambda: cl.list_positions(deliveryDate=d, status="OPEN"),
+          [_err(200)], extra=_only("status", "OPEN", must_include=sp_a.id))
+    c.run("FIL-02b", "Positionen mit status=PROCESSED vor Marktschluss → keine offenen",
+          lambda: cl.list_positions(deliveryDate=d, status="PROCESSED"), [_err(200)], extra=_only("status", "PROCESSED"))
+    c.run("FIL-03", "Positionen mit eigener energyCommunityId → nur eigene",
+          lambda: cl.list_positions(deliveryDate=d, energyCommunityId=eg.id), [_err(200)],
+          extra=_only("energyCommunityId", eg.id, must_include=sp_a.id))
+    if (run.market or {}).get("resolution") == "QUARTER_HOUR" and sp_a.planned.interval_start:
+        iv = sp_a.planned.interval_start
+        c.run("FIL-04", "Positionen mit intervalStart → nur dieses Intervall",
+              lambda: cl.list_positions(deliveryDate=d, intervalStart=iv), [_err(200)],
+              extra=_only("intervalStart", iv, must_include=sp_a.id))
+    c.run("FIL-05", "Positionen mit ungültigem type → 400 INVALID_POSITION_TYPE", lambda: cl.list_positions(type="SELL"),
+          [_err(400, "INVALID_POSITION_TYPE")])
+    c.run("FIL-06", "Positionen mit ungültiger energyCommunityId → 400 INVALID_ID",
+          lambda: cl.list_positions(energyCommunityId="xyz"), [_err(400, "INVALID_ID")])
+    c.run("FIL-07", "Positionen mit ungültigem deliveryDate → 400 INVALID_DELIVERY_DATE",
+          lambda: cl.list_positions(deliveryDate="2026/11/20"), [_err(400, "INVALID_DELIVERY_DATE")])
+    c.run("FIL-08", "Positionen mit ungültigem intervalStart → 400 INVALID_INTERVAL",
+          lambda: cl.list_positions(deliveryDate=d, intervalStart="mittags"), [_err(400, "INVALID_INTERVAL")])
+    c.run("FIL-09", "Positionen mit ungültigem status → 400 VALIDATION_FAILED", lambda: cl.list_positions(status="FOO"),
+          [_err(400, "VALIDATION_FAILED")])
+    c.run("FIL-10", "Zuteilungen mit ungültiger energyCommunityId → 400 INVALID_ID (vor 409)",
+          lambda: cl.allocations(d, energyCommunityId="xyz"), [_err(400, "INVALID_ID")])
+    c.run("FIL-11", "Zuteilungen mit ungültigem intervalStart → 400 INVALID_INTERVAL (vor 409)",
+          lambda: cl.allocations(d, intervalStart="mittags"), [_err(400, "INVALID_INTERVAL")])
+    c.run("FIL-12", "Trades mit ungültiger direction → 400 VALIDATION_FAILED (vor 409)",
+          lambda: cl.trades(d, direction="SIDEWAYS"), [_err(400, "VALIDATION_FAILED")])
+    c.run("FIL-13", "Trades mit ungültiger positionId → 400 INVALID_ID (vor 409)",
+          lambda: cl.trades(d, positionId="xyz"), [_err(400, "INVALID_ID")])
+
+
+def _filter_checks_settled(c: Checker, run: "MarketRun", sp: "SubmittedPosition") -> None:
+    d = run.delivery_date
+    cl = sp.eg.client
+    c.run("FIL-20", "Trades mit direction=PLATFORM_BUYS → nur Ankäufe", lambda: cl.trades(d, direction="PLATFORM_BUYS"),
+          [_err(200)], extra=_only("direction", "PLATFORM_BUYS"))
+    c.run("FIL-21", "Trades mit direction=PLATFORM_SELLS → nur Verkäufe", lambda: cl.trades(d, direction="PLATFORM_SELLS"),
+          [_err(200)], extra=_only("direction", "PLATFORM_SELLS"))
+    c.run("FIL-22", "Trades mit positionId → nur diese Position", lambda: cl.trades(d, positionId=sp.id), [_err(200)],
+          extra=_only("positionId", sp.id))
+    if (run.market or {}).get("resolution") == "QUARTER_HOUR" and sp.planned.interval_start:
+        iv = sp.planned.interval_start
+        c.run("FIL-23", "Zuteilungen mit intervalStart → nur dieses Intervall", lambda: cl.allocations(d, intervalStart=iv),
+              [_err(200)], extra=_only("intervalStart", iv))
+        c.run("FIL-24", "Trades mit intervalStart → nur dieses Intervall", lambda: cl.trades(d, intervalStart=iv),
+              [_err(200)], extra=_only("intervalStart", iv))
+
+
+def _free_slot(sim: "Simulator", run: "MarketRun", live: list["SubmittedPosition"]):
+    """Ein Slot (EG + Intervall), den keine aktive Position belegt: (EG, Body) oder (None, None)."""
+    d = run.delivery_date
+    taken = {(p.eg.id, p.planned.interval_start) for p in live}
+    if (run.market or {}).get("resolution") == "QUARTER_HOUR":
+        sp = live[0]
+        for t in quarter_hours(resolve_delivery_date(d)):
+            if (sp.eg.id, format_utc(t)) not in taken:
+                return sp.eg, {"deliveryDate": d, "intervalStart": format_utc(t), "type": "DEMAND", "quantityKwh": Decimal(1)}
+        return None, None
+    eg = next((e for e in sim.egs if e.ready and (e.id, None) not in taken), None)
+    if eg:
+        return eg, {"deliveryDate": d, "type": "DEMAND", "quantityKwh": Decimal(1)}
+    return None, None
+
+
+def run_late_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
+    """closesAt ist erreicht, der Betreiber hat den Markt aber noch nicht geschlossen (Status OPEN): Der Server muss
+    neue, geänderte und stornierte Positionen trotzdem mit 409 MARKET_CLOSED ablehnen."""
+    c = Checker(sim, f"late:{run.delivery_date}")
+    live = [sp for sp in run.positions if sp.id and not sp.cancelled and sp.eg.ready]
+    if not live:
+        c.skip("CLOSES-*", "Checks nach closesAt bei Status OPEN", "keine eigenen Positionen")
+        return c.results
+    sp = live[0]
+    cl = sp.eg.client
+    submitter, free = _free_slot(sim, run, live)
+    if free:
+        c.run("CLOSES-01", "Neue Position nach closesAt (Markt noch OPEN) → 409 MARKET_CLOSED",
+              lambda: submitter.client.submit_position(free), [_err(409, "MARKET_CLOSED")],
+              on_unexpected_success=_cleanup(sim, submitter.client))
+    else:
+        c.skip("CLOSES-01", "Neue Position nach closesAt", "kein freier Slot")
+    upd = {"quantityKwh": sp.quantity}
+    if sp.price_expectation is not None:
+        upd["priceExpectationEurPerKwh"] = sp.price_expectation
+    c.run("CLOSES-02", "Position ändern nach closesAt (Markt noch OPEN) → 409 MARKET_CLOSED",
+          lambda: cl.update_position(sp.id, upd), [_err(409, "MARKET_CLOSED")])
+
+    def mark_cancelled(r: ApiResponse) -> None:
+        sp.cancelled, sp.status = True, "CANCELLED"
+    c.run("CLOSES-03", "Position stornieren nach closesAt (Markt noch OPEN) → 409 MARKET_CLOSED",
+          lambda: cl.cancel_position(sp.id), [_err(409, "MARKET_CLOSED")], on_unexpected_success=mark_cancelled)
+    return c.results
+
+
+def _inactive_checks(c: Checker, ids: str, label: str, client: ApiClient) -> None:
+    """Zugang einer nicht aktiven EG (PENDING/SUSPENDED): 403 vor 400 und 404, auch für Positions-Endpoints."""
+    rnd = str(uuid.uuid4())
+    nae = [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")]
+    c.run(f"{ids}b", f"{label}: Position einreichen → 403 ENERGY_COMMUNITY_NOT_ACTIVE",
+          lambda: client.submit_position({"deliveryDate": "2099-12-31", "type": "DEMAND", "quantityKwh": Decimal(1)}), nae)
+    c.run(f"{ids}c", f"{label}: Position ändern → 403 ENERGY_COMMUNITY_NOT_ACTIVE",
+          lambda: client.update_position(rnd, {"quantityKwh": Decimal(1)}), nae)
+    c.run(f"{ids}d", f"{label}: Position stornieren → 403 ENERGY_COMMUNITY_NOT_ACTIVE", lambda: client.cancel_position(rnd), nae)
+    c.run(f"{ids}e", f"{label}: Positionen auflisten → 403 ENERGY_COMMUNITY_NOT_ACTIVE", lambda: client.list_positions(), nae)
+
+
 # =====================================================================================================================
 def run_closed_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
     c = Checker(sim, f"closed:{run.delivery_date}")
@@ -307,18 +496,7 @@ def run_closed_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
     cl = sp.eg.client
 
     # neue Position in einem freien Slot, damit 409 eindeutig MARKET_CLOSED sein muss
-    taken = {(p.eg.id, p.planned.interval_start) for p in live}
-    free_body = None
-    if (run.market or {}).get("resolution") == "QUARTER_HOUR":
-        for t in quarter_hours(resolve_delivery_date(d)):
-            if (sp.eg.id, format_utc(t)) not in taken:
-                free_body = {"deliveryDate": d, "intervalStart": format_utc(t), "type": "DEMAND", "quantityKwh": Decimal(1)}
-                break
-        submitter = sp.eg
-    else:
-        submitter = next((e for e in sim.egs if e.ready and (e.id, None) not in taken), None)
-        if submitter:
-            free_body = {"deliveryDate": d, "type": "DEMAND", "quantityKwh": Decimal(1)}
+    submitter, free_body = _free_slot(sim, run, live)
     if free_body and submitter:
         c.run("CLOSED-01", "Neue Position nach Marktschluss → 409 MARKET_CLOSED",
               lambda: submitter.client.submit_position(free_body), [_err(409, "MARKET_CLOSED")],
@@ -340,6 +518,7 @@ def run_closed_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
               extra=lambda r: None if (r.body or {}).get("status") == "PROCESSED"
               else f"Status {(r.body or {}).get('status')}")
         c.run("CLOSED-07", "EG ruft eigene Zuteilungen ab → 200", lambda: cl.allocations(d), [_err(200)])
+        _filter_checks_settled(c, run, sp)
     return c.results
 
 
@@ -450,19 +629,29 @@ def run_admin_checks(sim: "Simulator") -> list[dict]:
               [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
         c.run("ADM-09", "PENDING-EG Login → 403 ENERGY_COMMUNITY_NOT_ACTIVE", lambda: anon.login(email, pw),
               [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
+        _inactive_checks(c, "ADM-08", "PENDING-EG", anon.with_auth(api_key=key))
     c.run("ADM-10", "PENDING → ACTIVE → 200", lambda: adm.set_status(ec_id, "ACTIVE"), [_err(200)])
     c.run("ADM-11", "ACTIVE → PENDING → 409 INVALID_STATUS_TRANSITION", lambda: adm.set_status(ec_id, "PENDING"),
           [_err(409, "INVALID_STATUS_TRANSITION")])
     if key:
         c.run("ADM-12", "Aktive EG mit API-Key → 200", anon.with_auth(api_key=key).me, [_err(200)])
+        old_token = None
+        if pw:
+            lg = c.run("ADM-12b", "Login der aktiven EG → 200", lambda: anon.login(email, pw), [_err(200)])
+            if lg and lg.status == 200 and isinstance(lg.body, dict):
+                old_token = lg.body.get("token")
         new = c.run("ADM-13", "Zugangsdaten neu vergeben → 201", lambda: adm.issue_credentials(ec_id), [_err(201)])
         c.run("ADM-14", "Alter API-Key nach Neuvergabe → 401", anon.with_auth(api_key=key).me, [_err(401, "UNAUTHORIZED")])
+        if old_token:
+            c.run("ADM-14b", "Altes Token nach Neuvergabe → 401", anon.with_auth(token=old_token).me,
+                  [_err(401, "UNAUTHORIZED")])
         if new and new.status == 201 and isinstance(new.body, dict):
             key = new.body.get("apiKey")
     c.run("ADM-15", "ACTIVE → SUSPENDED → 200", lambda: adm.set_status(ec_id, "SUSPENDED"), [_err(200)])
     if key:
         c.run("ADM-16", "Gesperrte EG mit API-Key → 403 ENERGY_COMMUNITY_NOT_ACTIVE", anon.with_auth(api_key=key).me,
               [_err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
+        _inactive_checks(c, "ADM-16", "gesperrte EG", anon.with_auth(api_key=key))
     c.run("ADM-17", "SUSPENDED → ACTIVE → 200", lambda: adm.set_status(ec_id, "ACTIVE"), [_err(200)])
     c.run("ADM-18", "EG-Liste mit Statusfilter → nur ACTIVE", lambda: adm.list_communities("ACTIVE"), [_err(200)],
           extra=lambda r: None if all(x.get("status") == "ACTIVE" for x in (r.body or [])) else "Filter wirkt nicht")
@@ -472,9 +661,54 @@ def run_admin_checks(sim: "Simulator") -> list[dict]:
     if used:
         c.run("ADM-21", "EG mit Positionen löschen → 409 ENERGY_COMMUNITY_IN_USE", lambda: adm.delete_community(used.id),
               [_err(409, "ENERGY_COMMUNITY_IN_USE")])
+    any_pos = next((sp for m in sim.markets for sp in m.positions if sp.id), None)
+    if any_pos:
+        c.run("ADM-23", "Admin ruft die Position einer EG ab → 200", lambda: adm.get_position(any_pos.id), [_err(200)],
+              extra=lambda r: None if (r.body or {}).get("id") == any_pos.id else "falsche Position zurückgegeben")
+        c.run("ADM-24", "Admin ruft eine EG ab → 200", lambda: adm.get_community(any_pos.eg.id), [_err(200)],
+              extra=lambda r: None if (r.body or {}).get("id") == any_pos.eg.id else "falsche EG zurückgegeben")
+        c.run("ADM-25", "Admin filtert Positionen nach energyCommunityId → nur diese EG",
+              lambda: adm.list_positions(energyCommunityId=any_pos.eg.id), [_err(200)],
+              extra=_only("energyCommunityId", any_pos.eg.id, must_include=any_pos.id))
     settled = next((m for m in sim.markets if m.final_status == "SETTLED"), None)
     if settled:
-        c.run("ADM-22", "Markt erneut schließen (idempotent) → 200 SETTLED", lambda: adm.close_market(settled.delivery_date),
-              [_err(200)], extra=lambda r: None if (r.body or {}).get("status") == "SETTLED"
-              else f"Status {(r.body or {}).get('status')}")
+        d = settled.delivery_date
+
+        def snapshot():
+            a, t = adm.allocations(d), adm.trades(d)
+            if a.status != 200 or t.status != 200 or not isinstance(a.body, list) or not isinstance(t.body, list):
+                return None
+            return (sorted((x.get("positionId"), str(x.get("allocatedKwh"))) for x in a.body),
+                    sorted((x.get("id"), str(x.get("quantityKwh")), str(x.get("amountEur")), x.get("positionId"))
+                           for x in t.body))
+
+        def unchanged(before):
+            def f(r: ApiResponse) -> str | None:
+                if (r.body or {}).get("status") != "SETTLED":
+                    return f"Status {(r.body or {}).get('status')}"
+                after = snapshot()
+                if before is None or after is None:
+                    return "Zuteilungen/Trades nicht abrufbar"
+                if after != before:
+                    return (f"Zuteilungen/Trades haben sich verändert: {len(before[1])} → {len(after[1])} Trades "
+                            f"(doppeltes Settlement?)")
+                return None
+            return f
+
+        before = snapshot()
+        c.run("ADM-22", "Markt erneut schließen (idempotent) → 200 SETTLED, Zuteilungen und Trades unverändert",
+              lambda: adm.close_market(d), [_err(200)], extra=unchanged(before))
+        answers: list[ApiResponse] = []
+
+        def parallel_close() -> ApiResponse:
+            with ThreadPoolExecutor(4) as ex:
+                answers.extend(ex.map(lambda _: adm.close_market(d), range(4)))
+            return answers[0]
+
+        def all_settled(r: ApiResponse) -> str | None:
+            bad = [f"{x.status} {(x.body or {}).get('status') if isinstance(x.body, dict) else ''}".strip()
+                   for x in answers if x.status != 200 or (x.body or {}).get("status") != "SETTLED"]
+            return f"{len(bad)} von {len(answers)} Antworten nicht 200/SETTLED: {', '.join(bad)}" if bad else unchanged(before)(r)
+        c.run("ADM-22c", "4 gleichzeitige close-Aufrufe auf abgewickeltem Markt → alle 200, Daten unverändert",
+              parallel_close, [_err(200)], extra=all_settled)
     return c.results

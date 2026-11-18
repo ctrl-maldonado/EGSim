@@ -126,6 +126,7 @@
         </details>
         <label class="f"><span>EGs automatisch einrichten</span><div><input type="checkbox" data-path="run.autoProvision" data-type="bool"> <small>fehlende oder ungültige Zugangsdaten selbst besorgen</small></div></label>
         <label class="f"><span>Markt selbst schließen</span><div><input type="checkbox" data-path="run.closeMarket" data-type="bool"> <small>nach dem Einreichen, nur auf Testsystemen</small></div></label>
+        <label class="f"><span>Gleichzeitige close-Aufrufe</span><div class="row"><input type="number" min="1" max="20" step="1" data-path="run.parallelClose" data-type="num"> <small>&gt; 1 prüft, dass nur ein Settlement entsteht (keine doppelten Trades)</small></div></label>
         <label class="f"><span>Admin-Checks</span><div><input type="checkbox" data-path="run.adminChecks" data-type="bool"> <small>Statuswechsel, Sperren, Löschen mit einer Wegwerf-EG</small></div></label>
 
         <h2 style="margin-top:20px">Markt &amp; Ablauf</h2>
@@ -147,6 +148,7 @@
 
         <h2 style="margin-top:20px">Prüfungen</h2>
         <label class="f"><span>Negativtests</span><div><input type="checkbox" data-path="run.checks" data-type="bool"> <small>Fehlercodes, Rollen, Mandantentrennung, Validierung</small></div></label>
+        <label class="f"><span>Schema-Prüfung</span><div><input type="checkbox" data-path="run.validateSchema" data-type="bool"> <small>jede Antwort gegen die Schemas des Datenvertrags (Pflichtfelder, Typen, Formate, Fehlerformat)</small></div></label>
         <label class="f"><span>Registrierungstests</span><div><input type="checkbox" data-path="run.registrationChecks" data-type="bool"> <small>legt eine PENDING-Test-EG auf der Plattform an</small></div></label>
         <label class="f"><span>Ergebnisse prüfen</span><input type="checkbox" data-path="run.verifyResults" data-type="bool"></label>
         <label class="f"><span>Nur simulierte EGs am Markt</span><div><input type="checkbox" data-path="run.allParticipantsSimulated" data-type="bool"> <small>dann rechnet EGSim das Matching komplett nach</small></div></label>

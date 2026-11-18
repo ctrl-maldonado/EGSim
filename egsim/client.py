@@ -12,6 +12,8 @@ from typing import Any
 
 import requests
 
+from egsim import contract
+
 log = logging.getLogger("egsim.http")
 
 
@@ -34,6 +36,7 @@ class ApiResponse:
     body: Any
     elapsed_ms: float
     error: str | None = None  # Transportfehler (Timeout, Verbindung)
+    content_type: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -66,6 +69,33 @@ class RequestStats:
         self.counts: dict[tuple[str, str], dict[int, int]] = defaultdict(lambda: defaultdict(int))
         self.latencies: dict[tuple[str, str], list[float]] = defaultdict(list)
         self.transport_errors = 0
+        self.validate_contract = True          # Antworten gegen die Schemas des Datenvertrags prüfen
+        self._contract_seq = 0
+        self.contract_log: list[dict] = []     # Abweichungen von Schema und Vertrag, je Antwort
+
+    @property
+    def contract_mark(self) -> int:
+        with self._lock:
+            return self._contract_seq
+
+    def record_contract(self, method: str, template: str, status: int, issues: list[tuple[str, str]], request: str) -> None:
+        with self._lock:
+            for severity, message in issues:
+                self._contract_seq += 1
+                self.contract_log.append({"seq": self._contract_seq, "method": method, "endpoint": template,
+                                          "status": status, "severity": severity, "message": message,
+                                          "request": request})
+
+    def contract_issues(self, since: int = 0) -> list[dict]:
+        """Abweichungen seit `since`, gleiche Meldungen je Endpoint und Status zusammengefasst."""
+        with self._lock:
+            rows = [e for e in self.contract_log if e["seq"] > since]
+        grouped: dict[tuple, dict] = {}
+        for e in rows:
+            key = (e["method"], e["endpoint"], e["status"], e["severity"], e["message"])
+            g = grouped.setdefault(key, {**e, "count": 0})
+            g["count"] += 1
+        return list(grouped.values())
 
     def record(self, method: str, template: str, status: int, ms: float) -> None:
         with self._lock:
@@ -184,7 +214,11 @@ class ApiClient:
         self.stats.record(method, template, r.status_code, ms)
         self._detail(method, path, clean_params, json_body, raw_body, r.status_code, body, ms, None)
         log.debug("[%s] %s %s -> %s (%.0f ms)", self.label, method, path, r.status_code, ms)
-        return ApiResponse(method, path, r.status_code, body, ms)
+        if self.stats.validate_contract and not template.startswith("/_mock"):
+            issues = contract.check_response(method, template, r.status_code, body, r.headers.get("Content-Type"))
+            if issues:
+                self.stats.record_contract(method, template, r.status_code, issues, f"{method} {path} -> {r.status_code}")
+        return ApiResponse(method, path, r.status_code, body, ms, content_type=r.headers.get("Content-Type"))
 
     def _detail(self, method, path, params, json_body, raw_body, status, body, ms, error) -> None:
         req = _to_jsonable(json_body) if json_body is not None else raw_body

@@ -1,0 +1,2893 @@
+openapi: 3.1.0
+info:
+  title: Handelsplattform Energiegemeinschaften
+  version: 0.2.0
+  description: |
+    Gemeinsamer Datenvertrag der Handelsplattformen (Entwurf 0.2).
+
+    Version 0.2 setzt die Rückmeldung vom 16.11.2026 um. Die Struktur aus 0.1 bleibt erhalten.
+    Alles, was mit **(Vorschlag)** markiert ist, schlagen wir zur Abstimmung vor. Es ist noch nicht gemeinsam beschlossen.
+
+    ## Allgemeine Konventionen
+    - Format: JSON, Fehler mit `code` und `message`
+    - Alle IDs sind UUIDs (RFC 9562)
+    - Eigene Kennung einer Ressource heißt immer `id`, Verweise heißen `energyCommunityId` bzw. `positionId`
+    - `deliveryDate`: `YYYY-MM-DD` (Europe/Vienna)
+    - Zeitstempel: RFC 3339 (`date-time`), bevorzugt UTC
+    - Mengen in kWh, Preise in EUR/kWh, Beträge in EUR (2 Nachkommastellen)
+    - Anmeldung: Web-UI mit `POST /auth/login` (E-Mail und Passwort), danach `Authorization: Bearer <token>`; `POST /auth/logout` macht das Token sofort ungültig. Systeme nutzen den API-Key im Header `X-API-Key`. Alle Endpoints außer Registrierung, Login und `/health/*` brauchen eines von beiden
+    - Rollen: `ADMIN` und `ENERGY_COMMUNITY`. Die Rolle ergibt sich aus den Zugangsdaten, `GET /me` zeigt sie an. Jeder Endpoint nennt die erlaubten Rollen in `x-roles`
+    - Registrierung: EGs registrieren sich selbst mit E-Mail (`POST /energy-communities`, Status `PENDING`). Der Admin schaltet sie mit `PUT /energy-communities/{id}/status` frei (`ACTIVE`) und vergibt API-Key und Passwort (`POST /energy-communities/{id}/credentials`), die er der EG manuell übergibt
+    - Der Admin-Account (E-Mail, Passwort, API-Key) wird vom Betreiber konfiguriert (z. B. Kubernetes-Secret)
+    - Eine EG sieht und ändert nur ihre eigenen Daten (Profil, Positionen, Zuteilungen, Handelsabschlüsse), fremde Daten: `403` (Details unter „Mandantentrennung“)
+    - Nur `ACTIVE`-EGs können sich anmelden und Positionen einreichen, ändern oder stornieren
+    - Nur der Admin darf EGs auflisten, löschen, den Status ändern, Zugangsdaten vergeben, Märkte schließen und das Tagesergebnis abrufen
+    - Pro EG, Liefertag und Lieferintervall genau eine Position (`OFFER` oder `DEMAND`). Im Tagesmarkt ist das eine Position pro Liefertag
+    - Ändern und Stornieren nur bis Marktschluss (Markt `OPEN` und `closesAt` noch nicht erreicht)
+    - Reserve nur bei Unterdeckung: `max(D - S, 0)`, wobei `S` nur die **handelbaren** Angebote zählt (siehe „Handels- und Preislogik“)
+
+    ## Zeitliche Auflösung (Vorschlag, Entscheidung offen)
+    Jeder Markt hat eine feste `resolution`, die der Betreiber pro Liefertag festlegt:
+    - `DAY` (Tagesmarkt): ein Lieferintervall pro Liefertag. Positionen haben kein `intervalStart` (in Antworten `null`). **Für das Labor schlagen wir `DAY` als Standard vor.**
+    - `QUARTER_HOUR` (15-Minuten-Markt): 96 Intervalle pro Liefertag (92 bzw. 100 an den Tagen der Zeitumstellung). Jede Position braucht `intervalStart`.
+
+    Regeln für `intervalStart`:
+    - UTC-Zeitstempel auf einer vollen Viertelstunde (Minute 00, 15, 30 oder 45, Sekunden 0), z. B. `2026-11-20T11:15:00Z`
+    - muss im Liefertag nach Europe/Vienna liegen; das Intervall dauert 15 Minuten
+    - fehlt bei `QUARTER_HOUR`, ist bei `DAY` angegeben oder liegt außerhalb des Liefertags: `400 INVALID_INTERVAL`
+
+    Der Markt wird weiterhin einmal pro Liefertag geschlossen. Matching, Teilzuteilung und Reserve werden aber für jedes Intervall einzeln berechnet.
+    Zuteilungen und Handelsabschlüsse enthalten `intervalStart`, das Tagesergebnis enthält zusätzlich `intervals`.
+
+    ## Handels- und Preislogik (Vorschlag)
+    Die Plattform ist Gegenpartei aller Geschäfte. Sie kauft von anbietenden EGs (`PLATFORM_BUYS`) und verkauft an nachfragende EGs (`PLATFORM_SELLS`).
+    Fehlende Mengen kauft sie als Reserve beim Kraftwerk zu.
+
+    **Preise.** Der Betreiber legt pro Markt drei Preise fest. Sie stehen ab Marktöffnung in `Market.prices` und ändern sich bis zum Settlement nicht:
+    - `buyPriceEurPerKwh`: den zahlt die Plattform den anbietenden EGs
+    - `sellPriceEurPerKwh`: den zahlen nachfragende EGs, auch für Mengen aus der Reserve
+    - `reservePriceEurPerKwh`: den zahlt die Plattform dem Kraftwerk für die Reserve
+
+    **Matching beim Marktschluss** (bei `QUARTER_HOUR` je Intervall):
+    1. Berücksichtigt werden nur Positionen mit Status `CLOSED`.
+    2. Ein Angebot ist **handelbar**, wenn es keine `priceExpectationEurPerKwh` hat oder diese höchstens `buyPriceEurPerKwh` beträgt. Angebote mit höherer Preisvorstellung werden nicht gehandelt (`allocatedKwh: 0`, `reason: PRICE_NOT_MET`).
+    3. `D` = Summe aller Bedarfe, `S` = Summe der handelbaren Angebote.
+    4. Ist `S <= D`, kauft die Plattform alle handelbaren Angebote vollständig. Ist `S > D`, kauft sie nur `D`. Jedes handelbare Angebot erhält dann denselben Anteil `D / S` (Teilzuteilung pro rata, `reason: PARTIALLY_ALLOCATED`). Ist `D = 0`, wird nichts gekauft (`reason: NOT_NEEDED`).
+    5. Reserve: `requiredKwh = max(D - S, 0)`. Angebote, die wegen ihrer Preisvorstellung nicht gehandelt werden, zählen also nicht zu `S` und erhöhen den Reservebedarf.
+    6. Bedarfe werden aus den gekauften Angeboten und der Reserve gedeckt. Liefert das Kraftwerk weniger als `requiredKwh` (`PARTIAL` oder `UNAVAILABLE`), erhält jeder Bedarf denselben Anteil der verfügbaren Menge (`reason: RESERVE_SHORTAGE`).
+
+    Beispiel Teilzuteilung: handelbare Angebote 100 kWh und 60 kWh, Bedarf 120 kWh. Anteil 120 / 160 = 0,75, Zuteilung 75 kWh und 45 kWh, keine Reserve.
+
+    **Runden.** Zugeteilte Mengen werden auf 0,001 kWh abgerundet. Den Rest aus dem Abrunden verteilt die Plattform in Schritten von 0,001 kWh nach `createdAt` der Positionen (bei Gleichstand nach `id`).
+    Beträge sind Menge × Preis, pro Handelsabschluss kaufmännisch auf 0,01 EUR gerundet. Für Geldbeträge Dezimalarithmetik verwenden, keine Gleitkommazahlen.
+
+    **Handelsabschlüsse.** Jeder Trade verweist mit `positionId` auf die Position, aus der er entstanden ist:
+    - pro gekauftem Angebot ein Trade `PLATFORM_BUYS` zu `buyPriceEurPerKwh`
+    - pro gedecktem Bedarf ein Trade `PLATFORM_SELLS` mit `fromReserve: false` für den Anteil aus Angeboten. Falls Reserve verwendet wurde, kommt ein zweiter Trade mit `fromReserve: true` dazu. Beide kosten `sellPriceEurPerKwh`. Der Reserveanteil wird pro rata auf die Bedarfe verteilt
+    - Mengen von 0 kWh erzeugen keinen Trade, nur eine Zuteilung
+
+    **Tagesergebnis.** `purchaseCostEur` ist die Summe der `PLATFORM_BUYS`, `salesRevenueEur` die Summe der `PLATFORM_SELLS`, `reserve.costEur = dispatchedKwh × reservePriceEurPerKwh`.
+    `marginEur = salesRevenueEur - purchaseCostEur - reserve.costEur` (kann negativ sein).
+
+    ## Mandantentrennung und Berechtigungen
+    Alle Berechtigungen prüft der Server. Ausgeblendete Buttons in der UI ersetzen keine Prüfung.
+    - Welche EG anfragt, ergibt sich nur aus API-Key bzw. Token, nie aus Pfad, Query oder Body.
+    - `POST /positions`: Für eine EG ist `energyCommunityId` optional. Fehlt sie, setzt der Server die eigene ID ein. Ist eine fremde ID angegeben: `403 FORBIDDEN`, es wird nichts gespeichert. Der Admin reicht keine Positionen ein (`403 FORBIDDEN`).
+    - Listen (`GET /positions`, `/allocations`, `/trades`): Für eine EG filtert der Server immer auf die eigene EG. Ein Filter `energyCommunityId` mit fremder ID ergibt `403 FORBIDDEN` (keine leere Liste). Der Admin sieht alles und darf frei filtern.
+    - Einzelressourcen (`/positions/{id}`, `/energy-communities/{id}`): Der Server lädt die Ressource und prüft die Eigentümerschaft, bevor er sie zurückgibt oder ändert. Fremde Ressource: `403 FORBIDDEN`.
+    - Zugangsdaten einer EG, die nicht `ACTIVE` ist, werden mit `403 ENERGY_COMMUNITY_NOT_ACTIVE` abgelehnt.
+    - Reihenfolge der Prüfungen: `401` (angemeldet?) → `403` (Rolle, EG aktiv?) → `400` (Format) → `404` (existiert?) → `403` (eigene Ressource?) → `409`/`422` (Zustand).
+    - Passwörter und API-Keys werden nur gehasht gespeichert. Im Klartext erscheinen sie nur einmal in der Antwort von `POST /energy-communities/{id}/credentials`, nie in Logs. Außerhalb von `localhost` nur über HTTPS. (Vorschlag)
+
+    ## Rollen und Statusänderungen
+    - `PUT /energy-communities/{id}` ändert nur das Profil (`name`, `description`). `status` ist dort nicht erlaubt (`400 VALIDATION_FAILED`).
+    - Den Status ändert nur der Admin, und zwar über `PUT /energy-communities/{id}/status`.
+    - Erlaubte Übergänge (Vorschlag): `PENDING → ACTIVE`, `PENDING → SUSPENDED`, `ACTIVE → SUSPENDED`, `SUSPENDED → ACTIVE`. Zurück zu `PENDING` geht nicht. Andere Übergänge: `409 INVALID_STATUS_TRANSITION`. Wird derselbe Status erneut gesetzt, antwortet der Server mit `200` ohne Änderung.
+    - Positionen einer EG, die beim Marktschluss nicht `ACTIVE` ist, werden `REJECTED` (`rejectionReason: ENERGY_COMMUNITY_NOT_ACTIVE`). (Vorschlag)
+
+    ## Statusübergänge bei Marktschluss und Settlement (Vorschlag)
+    Markt:
+
+    | Von | Nach | Auslöser |
+    |---|---|---|
+    | – | `OPEN` | Betreiber legt den Markt für einen Liefertag an |
+    | `OPEN` | `CLOSED` | Admin ruft `POST /markets/{deliveryDate}/close` auf. Alle `OPEN`-Positionen werden `CLOSED` bzw. `REJECTED` |
+    | `CLOSED` | `SETTLED` | Settlement erfolgreich: Zuteilungen, Trades und Ergebnis werden in einem Schritt (atomar) gespeichert |
+    | `CLOSED` | `FAILED` | Settlement fehlgeschlagen: Es wird nichts gespeichert, `failureReason` nennt den Grund |
+    | `FAILED` | `CLOSED` | Admin ruft `close` erneut auf (neuer Versuch) |
+
+    - Ab `closesAt` lehnt der Server neue, geänderte und stornierte Positionen mit `409 MARKET_CLOSED` ab, auch wenn der Admin den Markt noch nicht geschlossen hat.
+    - `close` ist idempotent: Bei `CLOSED` oder `SETTLED` wird nichts neu berechnet.
+    - `close` antwortet mit `200`, wenn das Settlement fertig ist (`SETTLED`), und mit `202`, wenn es noch läuft (`CLOSED`). Dann `GET /markets/{deliveryDate}` abfragen, bis der Status `SETTLED` oder `FAILED` ist.
+    - Ergebnisse (`/result`, `/allocations`, `/trades`) gibt es nur bei `SETTLED`, sonst `409 MARKET_NOT_SETTLED`. `SETTLED` ist endgültig.
+
+    Position:
+
+    | Von | Nach | Auslöser |
+    |---|---|---|
+    | – | `OPEN` | EG reicht die Position ein |
+    | `OPEN` | `CANCELLED` | EG storniert vor Marktschluss |
+    | `OPEN` | `CLOSED` | Marktschluss, EG ist `ACTIVE` |
+    | `OPEN` | `REJECTED` | Marktschluss, EG ist nicht `ACTIVE` |
+    | `CLOSED` | `PROCESSED` | Settlement erfolgreich; es gibt eine Zuteilung, eventuell mit 0 kWh |
+
+    `CANCELLED`, `REJECTED` und `PROCESSED` sind Endzustände. Bei `FAILED` bleiben die Positionen `CLOSED`.
+
+    ## Beispielablauf
+    Die Beispiele `flow…` an den Endpoints bilden einen vollständigen Ablauf mit durchgehenden IDs (auch als JSON-Dateien im Ordner `beispiele/`).
+    Liefertag 2026-11-20, Tagesmarkt, Preise: Ankauf 0,10, Verkauf 0,14, Reserve 0,20 EUR/kWh.
+    1. EG Sonnenfeld registriert sich (`PENDING`), der Admin aktiviert sie und vergibt Zugangsdaten, die EG meldet sich an
+    2. EG Sonnenfeld bietet 120 kWh mit Preisvorstellung 0,09 an und ändert auf 100 kWh mit Preisvorstellung 0,08
+    3. EG Windpark Nord bietet 50 kWh mit Preisvorstellung 0,12 an (zu teuer, wird nicht gehandelt)
+    4. EG Altstadt meldet einen Bedarf von 130 kWh an
+    5. Der Admin schließt den Markt. `S` = 100, `D` = 130, Reserve 30 kWh
+    6. Zuteilungen, drei Handelsabschlüsse und Tagesergebnis: Einkauf 10,00 EUR, Verkauf 18,20 EUR, Reserve 6,00 EUR, Marge 2,20 EUR
+
+    ## Validation
+    - IDs: valid UUID in the format `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`; the `id` of an energy community is generated by the platform
+    - `email`: valid email address, at most 254 characters, unique per energy community
+    - `password` (login): required, at most 128 characters; generated passwords have at least 8 characters
+    - `name`: 1-120 characters, not only whitespace
+    - `description` (optional): 1-500 characters
+    - `status`: `PENDING`, `ACTIVE` or `SUSPENDED`; only the admin may set it, and only via `PUT /energy-communities/{id}/status` (new energy communities start as `PENDING`)
+    - `deliveryDate`: format `YYYY-MM-DD`, not in the past
+    - `intervalStart`: required for `QUARTER_HOUR` markets, not allowed for `DAY` markets; UTC on a full quarter hour within the delivery day
+    - `quantityKwh`: greater than 0, at most 1,000,000, at most 3 decimal places
+    - Prices: 0 to 100 EUR/kWh, at most 5 decimal places
+    - Decimal places are checked by the server and reported as `INVALID_QUANTITY` or `INVALID_PRICE` (schema validators handle decimals unreliably)
+    - `priceExpectationEurPerKwh` is optional and only allowed for `OFFER`; it is the minimum price the energy community accepts
+    - Missing required fields or unknown fields: `400 VALIDATION_FAILED` with `details` per field
+
+    ## Error codes
+    Error format: `{ "code": "...", "message": "...", "details": [{ "field": "/quantityKwh", "code": "...", "message": "..." }] }`
+
+    | HTTP | Code | Meaning |
+    |---|---|---|
+    | 400 | `VALIDATION_FAILED` | At least one field is invalid. |
+    | 400 | `INVALID_ID` | The ID is not a valid UUID. |
+    | 400 | `INVALID_DELIVERY_DATE` | deliveryDate must be in the format YYYY-MM-DD. |
+    | 400 | `INVALID_INTERVAL` | intervalStart is missing, not allowed or not a quarter hour of the delivery day. |
+    | 400 | `INVALID_POSITION_TYPE` | type must be OFFER or DEMAND. |
+    | 400 | `INVALID_QUANTITY` | quantityKwh must be greater than 0 (max. 3 decimal places). |
+    | 400 | `INVALID_PRICE` | The price must be between 0 and 100 EUR/kWh (max. 5 decimal places). |
+    | 401 | `UNAUTHORIZED` | API key or token is missing, invalid or expired. |
+    | 401 | `INVALID_CREDENTIALS` | Email or password is wrong. |
+    | 403 | `FORBIDDEN` | You are not allowed to access this resource or perform this action. |
+    | 403 | `ENERGY_COMMUNITY_NOT_ACTIVE` | The energy community is not active (pending approval or suspended). |
+    | 404 | `ENERGY_COMMUNITY_NOT_FOUND` | The energy community does not exist. |
+    | 404 | `POSITION_NOT_FOUND` | The position does not exist. |
+    | 404 | `MARKET_NOT_FOUND` | No market exists for the delivery date. |
+    | 409 | `EMAIL_ALREADY_REGISTERED` | An energy community with this email is already registered. |
+    | 409 | `ENERGY_COMMUNITY_IN_USE` | The energy community cannot be deleted because it has positions or trades. |
+    | 409 | `INVALID_STATUS_TRANSITION` | This status change is not allowed. |
+    | 409 | `POSITION_ALREADY_EXISTS` | A position already exists for this energy community, delivery date and interval. |
+    | 409 | `POSITION_NOT_MODIFIABLE` | The position is cancelled or already processed and can no longer be changed. |
+    | 409 | `MARKET_CLOSED` | The market is already closed. |
+    | 409 | `MARKET_NOT_SETTLED` | The market result is not available yet. |
+    | 422 | `DELIVERY_DATE_IN_PAST` | The delivery date is in the past. |
+    | 500 | `INTERNAL_ERROR` | Internal error. |
+servers:
+- url: http://localhost:8080
+tags:
+- name: Authentication
+  description: Rolle und Identität zum API-Key
+- name: Energy Communities
+  description: Verwaltung der Energiegemeinschaften
+- name: Positions
+  description: Tagesangebot bzw. Tagesbedarf
+- name: Markets
+  description: Tagesmarkt je Liefertag
+- name: Results
+  description: Zuteilungen, Handelsabschlüsse, Tagesergebnis
+- name: Operations
+  description: Kubernetes-Probes
+security:
+- ApiKeyAuth: []
+- BearerAuth: []
+paths:
+  /auth/login:
+    post:
+      tags:
+      - Authentication
+      summary: Mit E-Mail und Passwort anmelden
+      description: 'Rollen: Ohne Anmeldung. EGs, die nicht ACTIVE sind, erhalten 403 ENERGY_COMMUNITY_NOT_ACTIVE.'
+      operationId: login
+      x-roles: &id003 []
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              flow04_login:
+                summary: 'Ablauf 4: EG Sonnenfeld meldet sich an'
+                value:
+                  email: kontakt@eg-sonnenfeld.example
+                  password: <Passwort aus Schritt 3>
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+              examples:
+                flow04_login:
+                  summary: 'Ablauf 4: Token'
+                  value:
+                    token: <Token>
+                    tokenType: Bearer
+                    expiresIn: 3600
+                    role: ENERGY_COMMUNITY
+                    energyCommunity: &id002
+                      id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                      email: kontakt@eg-sonnenfeld.example
+                      name: EG Sonnenfeld
+                      description: Photovoltaik-Gemeinschaft
+                      status: ACTIVE
+                      createdAt: '2026-11-17T08:00:00Z'
+                      updatedAt: '2026-11-17T09:30:00Z'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_CREDENTIALS:
+                  $ref: '#/components/examples/INVALID_CREDENTIALS'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+  /auth/logout:
+    post:
+      tags:
+      - Authentication
+      summary: Abmelden
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten).'
+      operationId: logout
+      x-roles: &id001
+      - ADMIN
+      - ENERGY_COMMUNITY
+      security:
+      - BearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+  /me:
+    get:
+      tags:
+      - Authentication
+      summary: Eigene Rolle und EG abrufen
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten).'
+      operationId: getMe
+      x-roles: *id001
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+              examples:
+                energyCommunity:
+                  summary: Als EG angemeldet
+                  value:
+                    role: ENERGY_COMMUNITY
+                    energyCommunity: *id002
+                admin:
+                  summary: Als Admin angemeldet
+                  value:
+                    role: ADMIN
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+  /energy-communities:
+    post:
+      tags:
+      - Energy Communities
+      summary: EG registrieren
+      description: 'Rollen: Ohne Anmeldung. Neue EGs starten immer mit Status PENDING.'
+      operationId: registerEnergyCommunity
+      x-roles: *id003
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnergyCommunityRegistration'
+            examples:
+              flow01_register:
+                summary: 'Ablauf 1: EG Sonnenfeld registriert sich'
+                value:
+                  email: kontakt@eg-sonnenfeld.example
+                  name: EG Sonnenfeld
+                  description: Photovoltaik-Gemeinschaft
+      responses:
+        '201':
+          description: Created (status PENDING)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnergyCommunity'
+              examples:
+                flow01_register:
+                  summary: 'Ablauf 1: Status PENDING'
+                  value:
+                    id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    email: kontakt@eg-sonnenfeld.example
+                    name: EG Sonnenfeld
+                    description: Photovoltaik-Gemeinschaft
+                    status: PENDING
+                    createdAt: '2026-11-17T08:00:00Z'
+                    updatedAt: '2026-11-17T08:00:00Z'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                EMAIL_ALREADY_REGISTERED:
+                  $ref: '#/components/examples/EMAIL_ALREADY_REGISTERED'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+    get:
+      tags:
+      - Energy Communities
+      summary: EGs auflisten
+      description: 'Rollen: Nur ADMIN.'
+      operationId: listEnergyCommunities
+      x-roles: &id004
+      - ADMIN
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      parameters:
+      - name: status
+        in: query
+        schema:
+          $ref: '#/components/schemas/EnergyCommunityStatus'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EnergyCommunity'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+  /energy-communities/{id}:
+    parameters:
+    - $ref: '#/components/parameters/EnergyCommunityId'
+    get:
+      tags:
+      - Energy Communities
+      summary: EG abrufen
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Fremde EG: 403 FORBIDDEN.'
+      operationId: getEnergyCommunity
+      x-roles: *id001
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnergyCommunity'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_FOUND:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+    put:
+      tags:
+      - Energy Communities
+      summary: EG bearbeiten
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Ändert nur name und description. Der
+        Status wird ausschließlich über PUT /energy-communities/{id}/status geändert; ein Feld status im Body ergibt 400 VALIDATION_FAILED.
+        Fremde EG: 403 FORBIDDEN.'
+      operationId: updateEnergyCommunity
+      x-roles: *id001
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnergyCommunityUpdate'
+            examples:
+              profile:
+                summary: Beschreibung ändern
+                value:
+                  description: Photovoltaik und Speicher
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnergyCommunity'
+              examples:
+                profile:
+                  summary: Profil geändert
+                  value:
+                    id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    email: kontakt@eg-sonnenfeld.example
+                    name: EG Sonnenfeld
+                    description: Photovoltaik und Speicher
+                    status: ACTIVE
+                    createdAt: '2026-11-17T08:00:00Z'
+                    updatedAt: '2026-11-17T12:00:00Z'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_FOUND:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+    delete:
+      tags:
+      - Energy Communities
+      summary: EG löschen
+      description: 'Rollen: Nur ADMIN.'
+      operationId: deleteEnergyCommunity
+      x-roles: *id004
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_FOUND:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_IN_USE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_IN_USE'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+  /energy-communities/{id}/credentials:
+    parameters:
+    - $ref: '#/components/parameters/EnergyCommunityId'
+    post:
+      tags:
+      - Energy Communities
+      summary: API-Key und Passwort vergeben
+      description: 'Rollen: Nur ADMIN. Neue Zugangsdaten ersetzen alte; alte API-Keys und Tokens werden ungültig. Klartext
+        nur in dieser Antwort.'
+      operationId: issueCredentials
+      x-roles: *id004
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      responses:
+        '201':
+          description: Created (Zugangsdaten werden nur einmal angezeigt)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credentials'
+              examples:
+                flow03_credentials:
+                  summary: 'Ablauf 3: Zugangsdaten (Platzhalter)'
+                  value:
+                    apiKey: <einmalig angezeigter API-Key>
+                    password: <einmalig angezeigtes Passwort>
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_FOUND:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+  /energy-communities/{id}/status:
+    parameters:
+    - $ref: '#/components/parameters/EnergyCommunityId'
+    put:
+      tags:
+      - Energy Communities
+      summary: Status einer EG ändern
+      description: 'Rollen: Nur ADMIN. Getrennt von der Profilbearbeitung. Erlaubt: PENDING → ACTIVE, PENDING → SUSPENDED,
+        ACTIVE → SUSPENDED, SUSPENDED → ACTIVE (Vorschlag). Gleicher Status: 200 ohne Änderung.'
+      operationId: changeEnergyCommunityStatus
+      x-roles:
+      - ADMIN
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnergyCommunityStatusUpdate'
+            examples:
+              flow02_activate:
+                summary: 'Ablauf 2: Admin schaltet EG Sonnenfeld frei'
+                value:
+                  status: ACTIVE
+              suspend:
+                summary: EG sperren
+                value:
+                  status: SUSPENDED
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnergyCommunity'
+              examples:
+                flow02_activate:
+                  summary: 'Ablauf 2: EG ist ACTIVE'
+                  value: *id002
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_FOUND:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_STATUS_TRANSITION:
+                  $ref: '#/components/examples/INVALID_STATUS_TRANSITION'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+  /positions:
+    post:
+      tags:
+      - Positions
+      summary: Angebot oder Bedarf einreichen
+      description: 'Rollen: Nur ENERGY_COMMUNITY (nur eigene Daten). Die EG ergibt sich aus den Zugangsdaten. energyCommunityId
+        ist optional; eine fremde ID ergibt 403 FORBIDDEN.'
+      operationId: submitPosition
+      x-roles: &id005
+      - ENERGY_COMMUNITY
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PositionRequest'
+            examples:
+              flow06_offerA:
+                summary: 'Ablauf 6: EG Sonnenfeld bietet 120 kWh an (energyCommunityId weggelassen)'
+                value:
+                  deliveryDate: '2026-11-20'
+                  type: OFFER
+                  quantityKwh: 120
+                  priceExpectationEurPerKwh: 0.09
+              flow08_offerB:
+                summary: 'Ablauf 8: EG Windpark Nord bietet 50 kWh zu mind. 0,12 an'
+                value:
+                  deliveryDate: '2026-11-20'
+                  type: OFFER
+                  quantityKwh: 50
+                  priceExpectationEurPerKwh: 0.12
+              flow09_demandC:
+                summary: 'Ablauf 9: EG Altstadt braucht 130 kWh'
+                value:
+                  deliveryDate: '2026-11-20'
+                  type: DEMAND
+                  quantityKwh: 130
+              quarterHourOffer:
+                summary: '15-Minuten-Markt: Angebot für 12:15–12:30 Uhr Wiener Zeit'
+                value:
+                  deliveryDate: '2026-11-20'
+                  intervalStart: '2026-11-20T11:15:00Z'
+                  type: OFFER
+                  quantityKwh: 2.5
+                  priceExpectationEurPerKwh: 0.08
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Position'
+              examples:
+                flow06_offerA:
+                  summary: Ablauf 6
+                  value:
+                    id: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    type: OFFER
+                    quantityKwh: 120
+                    priceExpectationEurPerKwh: 0.09
+                    status: OPEN
+                    rejectionReason: null
+                    createdAt: '2026-11-18T09:00:00Z'
+                    updatedAt: '2026-11-18T09:00:00Z'
+                flow08_offerB:
+                  summary: Ablauf 8
+                  value:
+                    id: 7c2b9a4f-3ea5-4b88-8d2f-1a6f9b8c2345
+                    energyCommunityId: 5a2d9e71-8c4b-4f1e-9b3a-7e6f2c1d0b21
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    type: OFFER
+                    quantityKwh: 50
+                    priceExpectationEurPerKwh: 0.12
+                    status: OPEN
+                    rejectionReason: null
+                    createdAt: '2026-11-18T09:20:00Z'
+                    updatedAt: '2026-11-18T09:20:00Z'
+                flow09_demandC:
+                  summary: Ablauf 9
+                  value:
+                    id: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
+                    energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    type: DEMAND
+                    quantityKwh: 130
+                    status: OPEN
+                    rejectionReason: null
+                    createdAt: '2026-11-18T09:40:00Z'
+                    updatedAt: '2026-11-18T09:40:00Z'
+                quarterHourOffer:
+                  summary: 15-Minuten-Markt
+                  value:
+                    id: d4c6eb85-4a99-4fc1-9e73-96a51c28dbfa
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    deliveryDate: '2026-11-20'
+                    intervalStart: '2026-11-20T11:15:00Z'
+                    type: OFFER
+                    quantityKwh: 2.5
+                    priceExpectationEurPerKwh: 0.08
+                    status: OPEN
+                    rejectionReason: null
+                    createdAt: '2026-11-18T09:00:00Z'
+                    updatedAt: '2026-11-18T09:00:00Z'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+                INVALID_DELIVERY_DATE:
+                  $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+                INVALID_POSITION_TYPE:
+                  $ref: '#/components/examples/INVALID_POSITION_TYPE'
+                INVALID_QUANTITY:
+                  $ref: '#/components/examples/INVALID_QUANTITY'
+                INVALID_PRICE:
+                  $ref: '#/components/examples/INVALID_PRICE'
+                INVALID_INTERVAL:
+                  $ref: '#/components/examples/INVALID_INTERVAL'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden (z. B. fremde energyCommunityId, Admin, EG nicht ACTIVE)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+                FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
+                  $ref: '#/components/examples/FORBIDDEN_FOREIGN_ENERGY_COMMUNITY'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_FOUND:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+                MARKET_NOT_FOUND:
+                  $ref: '#/components/examples/MARKET_NOT_FOUND'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                POSITION_ALREADY_EXISTS:
+                  $ref: '#/components/examples/POSITION_ALREADY_EXISTS'
+                MARKET_CLOSED:
+                  $ref: '#/components/examples/MARKET_CLOSED'
+        '422':
+          description: Unprocessable Entity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                DELIVERY_DATE_IN_PAST:
+                  $ref: '#/components/examples/DELIVERY_DATE_IN_PAST'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+    get:
+      tags:
+      - Positions
+      summary: Positionen auflisten
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Für EGs filtert der Server immer auf
+        die eigene EG.'
+      operationId: listPositions
+      x-roles: *id001
+      parameters:
+      - name: energyCommunityId
+        in: query
+        schema:
+          $ref: '#/components/schemas/EnergyCommunityId'
+        description: Nur Admin frei wählbar; für EGs nur die eigene ID (sonst 403).
+      - name: deliveryDate
+        in: query
+        schema:
+          $ref: '#/components/schemas/DeliveryDate'
+      - name: intervalStart
+        in: query
+        description: Nur bei QUARTER_HOUR-Märkten.
+        schema:
+          $ref: '#/components/schemas/IntervalStart'
+      - name: type
+        in: query
+        schema:
+          $ref: '#/components/schemas/PositionType'
+      - name: status
+        in: query
+        schema:
+          $ref: '#/components/schemas/PositionStatus'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Position'
+              examples:
+                ownPositions:
+                  summary: EG Sonnenfeld sieht nur eigene Positionen
+                  value:
+                  - &id006
+                    id: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    type: OFFER
+                    quantityKwh: 100
+                    priceExpectationEurPerKwh: 0.08
+                    status: OPEN
+                    rejectionReason: null
+                    createdAt: '2026-11-18T09:00:00Z'
+                    updatedAt: '2026-11-18T10:15:00Z'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+                INVALID_DELIVERY_DATE:
+                  $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+                INVALID_POSITION_TYPE:
+                  $ref: '#/components/examples/INVALID_POSITION_TYPE'
+                INVALID_INTERVAL:
+                  $ref: '#/components/examples/INVALID_INTERVAL'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+                FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
+                  $ref: '#/components/examples/FORBIDDEN_FOREIGN_ENERGY_COMMUNITY'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+  /positions/{id}:
+    parameters:
+    - $ref: '#/components/parameters/PositionId'
+    get:
+      tags:
+      - Positions
+      summary: Position abrufen
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Fremde Position: 403 FORBIDDEN.'
+      operationId: getPosition
+      x-roles: *id001
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Position'
+              examples:
+                flow13_processed:
+                  summary: 'Nach dem Settlement: PROCESSED'
+                  value:
+                    id: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    type: OFFER
+                    quantityKwh: 100
+                    priceExpectationEurPerKwh: 0.08
+                    status: PROCESSED
+                    rejectionReason: null
+                    createdAt: '2026-11-18T09:00:00Z'
+                    updatedAt: '2026-11-19T11:00:05Z'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                POSITION_NOT_FOUND:
+                  $ref: '#/components/examples/POSITION_NOT_FOUND'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+    put:
+      tags:
+      - Positions
+      summary: Position ändern
+      description: 'Rollen: Nur ENERGY_COMMUNITY (nur eigene Daten). Nur eigene Positionen mit Status OPEN, solange der Markt
+        offen ist.'
+      operationId: updatePosition
+      x-roles: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PositionUpdate'
+            examples:
+              flow07_updateA:
+                summary: 'Ablauf 7: EG Sonnenfeld ändert auf 100 kWh zu mind. 0,08'
+                value:
+                  quantityKwh: 100
+                  priceExpectationEurPerKwh: 0.08
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Position'
+              examples:
+                flow07_updateA:
+                  summary: Ablauf 7
+                  value: *id006
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+                INVALID_QUANTITY:
+                  $ref: '#/components/examples/INVALID_QUANTITY'
+                INVALID_PRICE:
+                  $ref: '#/components/examples/INVALID_PRICE'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                POSITION_NOT_FOUND:
+                  $ref: '#/components/examples/POSITION_NOT_FOUND'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_CLOSED:
+                  $ref: '#/components/examples/MARKET_CLOSED'
+                POSITION_NOT_MODIFIABLE:
+                  $ref: '#/components/examples/POSITION_NOT_MODIFIABLE'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+    delete:
+      tags:
+      - Positions
+      summary: Position stornieren
+      description: 'Rollen: Nur ENERGY_COMMUNITY (nur eigene Daten). Setzt den Status auf CANCELLED (kein Löschen). Nur vor
+        Marktschluss.'
+      operationId: cancelPosition
+      x-roles: *id005
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Position'
+              examples:
+                cancelled:
+                  summary: Stornierte Position (außerhalb des Ablaufs)
+                  value:
+                    id: c3b5da74-3f88-4eb0-8d62-85f40b17cae9
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    type: OFFER
+                    quantityKwh: 40
+                    status: CANCELLED
+                    rejectionReason: null
+                    createdAt: '2026-11-18T08:00:00Z'
+                    updatedAt: '2026-11-18T08:30:00Z'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                POSITION_NOT_FOUND:
+                  $ref: '#/components/examples/POSITION_NOT_FOUND'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_CLOSED:
+                  $ref: '#/components/examples/MARKET_CLOSED'
+                POSITION_NOT_MODIFIABLE:
+                  $ref: '#/components/examples/POSITION_NOT_MODIFIABLE'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+  /markets/{deliveryDate}:
+    parameters:
+    - $ref: '#/components/parameters/DeliveryDate'
+    get:
+      tags:
+      - Markets
+      summary: Marktstatus abrufen
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten).'
+      operationId: getMarket
+      x-roles: *id001
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+              examples:
+                flow05_open:
+                  summary: 'Ablauf 5: Markt offen, Preise bekannt'
+                  value:
+                    deliveryDate: '2026-11-20'
+                    resolution: DAY
+                    status: OPEN
+                    prices: &id007
+                      deliveryDate: '2026-11-20'
+                      buyPriceEurPerKwh: 0.1
+                      sellPriceEurPerKwh: 0.14
+                      reservePriceEurPerKwh: 0.2
+                    closesAt: '2026-11-19T11:00:00Z'
+                    closedAt: null
+                    settledAt: null
+                    failureReason: null
+                flow11_settled:
+                  summary: 'Ablauf 11: Markt abgewickelt'
+                  value:
+                    deliveryDate: '2026-11-20'
+                    resolution: DAY
+                    status: SETTLED
+                    prices: *id007
+                    closesAt: '2026-11-19T11:00:00Z'
+                    closedAt: '2026-11-19T11:00:02Z'
+                    settledAt: '2026-11-19T11:00:05Z'
+                    failureReason: null
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_DELIVERY_DATE:
+                  $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_NOT_FOUND:
+                  $ref: '#/components/examples/MARKET_NOT_FOUND'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+  /markets/{deliveryDate}/close:
+    parameters:
+    - $ref: '#/components/parameters/DeliveryDate'
+    post:
+      tags:
+      - Markets
+      summary: Markt schließen und abwickeln
+      description: 'Rollen: Nur ADMIN. Schließt den Markt und startet das Settlement (siehe Statusübergänge). Idempotent:
+        Bei CLOSED oder SETTLED wird nichts neu berechnet. Bei FAILED startet ein neuer Versuch.'
+      operationId: closeMarket
+      x-roles: *id004
+      responses:
+        '200':
+          description: Settlement abgeschlossen (SETTLED), oder der Markt war schon geschlossen
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+              examples:
+                flow10_close:
+                  summary: 'Ablauf 10: Markt geschlossen und abgewickelt'
+                  value:
+                    deliveryDate: '2026-11-20'
+                    resolution: DAY
+                    status: SETTLED
+                    prices: *id007
+                    closesAt: '2026-11-19T11:00:00Z'
+                    closedAt: '2026-11-19T11:00:02Z'
+                    settledAt: '2026-11-19T11:00:05Z'
+                    failureReason: null
+        '202':
+          description: Markt geschlossen (CLOSED), Settlement läuft noch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+              examples:
+                closing:
+                  summary: Settlement läuft noch
+                  value:
+                    deliveryDate: '2026-11-20'
+                    resolution: DAY
+                    status: CLOSED
+                    prices: *id007
+                    closesAt: '2026-11-19T11:00:00Z'
+                    closedAt: '2026-11-19T11:00:02Z'
+                    settledAt: null
+                    failureReason: null
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_DELIVERY_DATE:
+                  $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_NOT_FOUND:
+                  $ref: '#/components/examples/MARKET_NOT_FOUND'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+  /markets/{deliveryDate}/result:
+    parameters:
+    - $ref: '#/components/parameters/DeliveryDate'
+    get:
+      tags:
+      - Results
+      summary: Tagesergebnis abrufen
+      description: 'Rollen: Nur ADMIN.'
+      operationId: getMarketResult
+      x-roles: *id004
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketResult'
+              examples:
+                flow14_result:
+                  summary: 'Ablauf 14: Tagesergebnis'
+                  value:
+                    deliveryDate: '2026-11-20'
+                    resolution: DAY
+                    status: SETTLED
+                    settledAt: '2026-11-19T11:00:05Z'
+                    totalOfferedKwh: 150
+                    tradableOfferedKwh: 100
+                    totalDemandKwh: 130
+                    totalPurchasedKwh: 100
+                    totalSoldKwh: 130
+                    reserve:
+                      deliveryDate: '2026-11-20'
+                      status: COVERED
+                      requiredKwh: 30
+                      dispatchedKwh: 30
+                      priceEurPerKwh: 0.2
+                      costEur: 6.0
+                    prices: *id007
+                    purchaseCostEur: 10.0
+                    salesRevenueEur: 18.2
+                    marginEur: 2.2
+                quarterHour:
+                  summary: 15-Minuten-Markt (gekürzt auf 2 von 96 Intervallen)
+                  value:
+                    deliveryDate: '2026-11-20'
+                    resolution: QUARTER_HOUR
+                    status: SETTLED
+                    settledAt: '2026-11-19T11:00:05Z'
+                    totalOfferedKwh: 3.5
+                    tradableOfferedKwh: 2.5
+                    totalDemandKwh: 3.0
+                    totalPurchasedKwh: 1.8
+                    totalSoldKwh: 3.0
+                    reserve:
+                      deliveryDate: '2026-11-20'
+                      status: COVERED
+                      requiredKwh: 1.2
+                      dispatchedKwh: 1.2
+                      priceEurPerKwh: 0.2
+                      costEur: 0.24
+                    prices: *id007
+                    purchaseCostEur: 0.18
+                    salesRevenueEur: 0.42
+                    marginEur: 0.0
+                    intervals:
+                    - intervalStart: '2026-11-19T23:00:00Z'
+                      totalOfferedKwh: 0
+                      tradableOfferedKwh: 0
+                      totalDemandKwh: 1.2
+                      totalPurchasedKwh: 0
+                      totalSoldKwh: 1.2
+                      reserve:
+                        deliveryDate: '2026-11-20'
+                        status: COVERED
+                        requiredKwh: 1.2
+                        dispatchedKwh: 1.2
+                        priceEurPerKwh: 0.2
+                        costEur: 0.24
+                    - intervalStart: '2026-11-20T11:15:00Z'
+                      totalOfferedKwh: 3.5
+                      tradableOfferedKwh: 2.5
+                      totalDemandKwh: 1.8
+                      totalPurchasedKwh: 1.8
+                      totalSoldKwh: 1.8
+                      reserve:
+                        deliveryDate: '2026-11-20'
+                        status: NOT_NEEDED
+                        requiredKwh: 0
+                        dispatchedKwh: 0
+                        priceEurPerKwh: null
+                        costEur: 0.0
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_DELIVERY_DATE:
+                  $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_NOT_FOUND:
+                  $ref: '#/components/examples/MARKET_NOT_FOUND'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_NOT_SETTLED:
+                  $ref: '#/components/examples/MARKET_NOT_SETTLED'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+  /markets/{deliveryDate}/allocations:
+    parameters:
+    - $ref: '#/components/parameters/DeliveryDate'
+    get:
+      tags:
+      - Results
+      summary: Zuteilungen abrufen
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Für EGs nur eigene Zuteilungen.'
+      operationId: listAllocations
+      x-roles: *id001
+      parameters:
+      - name: energyCommunityId
+        in: query
+        schema:
+          $ref: '#/components/schemas/EnergyCommunityId'
+        description: Nur Admin frei wählbar; für EGs nur die eigene ID (sonst 403).
+      - name: intervalStart
+        in: query
+        description: Nur bei QUARTER_HOUR-Märkten.
+        schema:
+          $ref: '#/components/schemas/IntervalStart'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Allocation'
+              examples:
+                flow12_allocationsAdmin:
+                  summary: 'Ablauf 12: alle Zuteilungen (Admin)'
+                  value:
+                  - deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    type: OFFER
+                    requestedKwh: 100
+                    allocatedKwh: 100
+                    reason: FULLY_ALLOCATED
+                  - &id008
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 7c2b9a4f-3ea5-4b88-8d2f-1a6f9b8c2345
+                    energyCommunityId: 5a2d9e71-8c4b-4f1e-9b3a-7e6f2c1d0b21
+                    type: OFFER
+                    requestedKwh: 50
+                    allocatedKwh: 0
+                    reason: PRICE_NOT_MET
+                  - deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
+                    energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
+                    type: DEMAND
+                    requestedKwh: 130
+                    allocatedKwh: 130
+                    reason: FULLY_ALLOCATED
+                flow12_allocationsOwn:
+                  summary: 'Ablauf 12: EG Windpark Nord sieht nur ihre (Preis nicht erreicht)'
+                  value:
+                  - *id008
+                partialAllocation:
+                  summary: 'Teilzuteilung pro rata (anderer Markt): 100 + 60 kWh Angebot, 120 kWh Bedarf'
+                  value:
+                  - deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: e5d7fc96-5baa-4ad2-8f84-a7b62d39ec0b
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    type: OFFER
+                    requestedKwh: 100
+                    allocatedKwh: 75
+                    reason: PARTIALLY_ALLOCATED
+                  - deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: f6e80da7-6cbb-4be3-9095-b8c73e4afd1c
+                    energyCommunityId: 5a2d9e71-8c4b-4f1e-9b3a-7e6f2c1d0b21
+                    type: OFFER
+                    requestedKwh: 60
+                    allocatedKwh: 45
+                    reason: PARTIALLY_ALLOCATED
+                  - deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 07f91eb8-7dcc-4cf4-a1a6-c9d84f5b0e2d
+                    energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
+                    type: DEMAND
+                    requestedKwh: 120
+                    allocatedKwh: 120
+                    reason: FULLY_ALLOCATED
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_DELIVERY_DATE:
+                  $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+                INVALID_INTERVAL:
+                  $ref: '#/components/examples/INVALID_INTERVAL'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+                FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
+                  $ref: '#/components/examples/FORBIDDEN_FOREIGN_ENERGY_COMMUNITY'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_NOT_FOUND:
+                  $ref: '#/components/examples/MARKET_NOT_FOUND'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_NOT_SETTLED:
+                  $ref: '#/components/examples/MARKET_NOT_SETTLED'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+  /markets/{deliveryDate}/trades:
+    parameters:
+    - $ref: '#/components/parameters/DeliveryDate'
+    get:
+      tags:
+      - Results
+      summary: Handelsabschlüsse abrufen
+      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Für EGs nur eigene Handelsabschlüsse.'
+      operationId: listTrades
+      x-roles: *id001
+      parameters:
+      - name: energyCommunityId
+        in: query
+        schema:
+          $ref: '#/components/schemas/EnergyCommunityId'
+        description: Nur Admin frei wählbar; für EGs nur die eigene ID (sonst 403).
+      - name: direction
+        in: query
+        schema:
+          $ref: '#/components/schemas/TradeDirection'
+      - name: intervalStart
+        in: query
+        description: Nur bei QUARTER_HOUR-Märkten.
+        schema:
+          $ref: '#/components/schemas/IntervalStart'
+      - name: positionId
+        in: query
+        description: Alle Handelsabschlüsse zu einer Position.
+        schema:
+          $ref: '#/components/schemas/PositionId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Trade'
+              examples:
+                flow13_tradesAdmin:
+                  summary: 'Ablauf 13: alle Handelsabschlüsse (Admin)'
+                  value:
+                  - id: 9d2e7a41-0c55-4b8e-9a3f-52c1d8e4f7b6
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    direction: PLATFORM_BUYS
+                    fromReserve: false
+                    quantityKwh: 100
+                    priceEurPerKwh: 0.1
+                    amountEur: 10.0
+                    createdAt: '2026-11-19T11:00:05Z'
+                  - &id009
+                    id: a1f3b852-1d66-4c9f-8b40-63d2e9f5a8c7
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
+                    energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
+                    direction: PLATFORM_SELLS
+                    fromReserve: false
+                    quantityKwh: 100
+                    priceEurPerKwh: 0.14
+                    amountEur: 14.0
+                    createdAt: '2026-11-19T11:00:05Z'
+                  - &id010
+                    id: b2a4c963-2e77-4daf-9c51-74e3fa06b9d8
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
+                    energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
+                    direction: PLATFORM_SELLS
+                    fromReserve: true
+                    quantityKwh: 30
+                    priceEurPerKwh: 0.14
+                    amountEur: 4.2
+                    createdAt: '2026-11-19T11:00:05Z'
+                flow13_tradesOwn:
+                  summary: 'Ablauf 13: EG Altstadt, Anteil Angebote und Anteil Reserve'
+                  value:
+                  - *id009
+                  - *id010
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INVALID_DELIVERY_DATE:
+                  $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+                INVALID_ID:
+                  $ref: '#/components/examples/INVALID_ID'
+                INVALID_INTERVAL:
+                  $ref: '#/components/examples/INVALID_INTERVAL'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                FORBIDDEN:
+                  $ref: '#/components/examples/FORBIDDEN'
+                FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
+                  $ref: '#/components/examples/FORBIDDEN_FOREIGN_ENERGY_COMMUNITY'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_NOT_FOUND:
+                  $ref: '#/components/examples/MARKET_NOT_FOUND'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                MARKET_NOT_SETTLED:
+                  $ref: '#/components/examples/MARKET_NOT_SETTLED'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+  /health/live:
+    get:
+      tags:
+      - Operations
+      summary: Liveness-Probe
+      description: 'Rollen: Ohne Anmeldung.'
+      operationId: livenessProbe
+      x-roles: *id003
+      security: []
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              examples:
+                up:
+                  summary: Bereit
+                  value:
+                    status: UP
+                    checks:
+                      database: UP
+  /health/ready:
+    get:
+      tags:
+      - Operations
+      summary: Readiness-Probe
+      description: 'Rollen: Ohne Anmeldung.'
+      operationId: readinessProbe
+      x-roles: *id003
+      security: []
+      responses:
+        '200':
+          description: Ready to receive traffic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              examples:
+                up:
+                  summary: Bereit
+                  value:
+                    status: UP
+                    checks:
+                      database: UP
+        '503':
+          description: Not ready (e.g. database unavailable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: 'API-Key für den Systemzugriff. Der Admin vergibt ihn manuell mit POST /energy-communities/{id}/credentials
+        und übergibt ihn der EG. Fehlt der Key oder ist er ungültig: 401.'
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: 'Token aus POST /auth/login (E-Mail und Passwort), gedacht für die Web-UI. Header: Authorization: Bearer
+        <token>. Das Token läuft nach expiresIn Sekunden ab: 401.'
+  parameters:
+    EnergyCommunityId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/EnergyCommunityId'
+    PositionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/PositionId'
+    DeliveryDate:
+      name: deliveryDate
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/DeliveryDate'
+  schemas:
+    EnergyCommunityId:
+      type: string
+      format: uuid
+      pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+      examples:
+      - 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+    PositionId:
+      type: string
+      format: uuid
+      pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+      examples:
+      - 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
+    DeliveryDate:
+      type: string
+      format: date
+      pattern: ^\d{4}-\d{2}-\d{2}$
+      examples:
+      - '2026-11-20'
+    Timestamp:
+      type: string
+      format: date-time
+    QuantityKwh:
+      type: number
+      exclusiveMinimum: 0
+      maximum: 1000000
+      examples:
+      - 120.5
+      x-maxDecimals: 3
+    QuantityKwhNonNegative:
+      type: number
+      minimum: 0
+      maximum: 1000000
+      x-maxDecimals: 3
+    PriceEurPerKwh:
+      type: number
+      minimum: 0
+      maximum: 100
+      examples:
+      - 0.1
+      x-maxDecimals: 5
+    AmountEur:
+      type: number
+      x-maxDecimals: 2
+    PositionType:
+      type: string
+      enum:
+      - OFFER
+      - DEMAND
+    PositionStatus:
+      type: string
+      enum:
+      - OPEN
+      - CANCELLED
+      - CLOSED
+      - PROCESSED
+      - REJECTED
+    MarketStatus:
+      type: string
+      enum:
+      - OPEN
+      - CLOSED
+      - SETTLED
+      - FAILED
+    TradeDirection:
+      type: string
+      enum:
+      - PLATFORM_BUYS
+      - PLATFORM_SELLS
+    ReserveStatus:
+      type: string
+      enum:
+      - NOT_NEEDED
+      - COVERED
+      - PARTIAL
+      - UNAVAILABLE
+    ErrorCode:
+      type: string
+      enum:
+      - VALIDATION_FAILED
+      - INVALID_ID
+      - INVALID_DELIVERY_DATE
+      - INVALID_INTERVAL
+      - INVALID_POSITION_TYPE
+      - INVALID_QUANTITY
+      - INVALID_PRICE
+      - UNAUTHORIZED
+      - INVALID_CREDENTIALS
+      - FORBIDDEN
+      - ENERGY_COMMUNITY_NOT_ACTIVE
+      - ENERGY_COMMUNITY_NOT_FOUND
+      - POSITION_NOT_FOUND
+      - MARKET_NOT_FOUND
+      - EMAIL_ALREADY_REGISTERED
+      - ENERGY_COMMUNITY_IN_USE
+      - INVALID_STATUS_TRANSITION
+      - POSITION_ALREADY_EXISTS
+      - POSITION_NOT_MODIFIABLE
+      - MARKET_CLOSED
+      - MARKET_NOT_SETTLED
+      - DELIVERY_DATE_IN_PAST
+      - INTERNAL_ERROR
+    Error:
+      type: object
+      required:
+      - code
+      - message
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+        details:
+          type: array
+          items:
+            type: object
+            required:
+            - field
+            - message
+            properties:
+              field:
+                type: string
+                examples:
+                - /quantityKwh
+              code:
+                $ref: '#/components/schemas/ErrorCode'
+              message:
+                type: string
+    EnergyCommunity:
+      type: object
+      required:
+      - id
+      - email
+      - name
+      - status
+      - createdAt
+      - updatedAt
+      properties:
+        id:
+          $ref: '#/components/schemas/EnergyCommunityId'
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        name:
+          type: string
+        description:
+          type: string
+        status:
+          $ref: '#/components/schemas/EnergyCommunityStatus'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    PositionRequest:
+      type: object
+      required:
+      - deliveryDate
+      - type
+      - quantityKwh
+      additionalProperties: false
+      properties:
+        energyCommunityId:
+          $ref: '#/components/schemas/EnergyCommunityId'
+          description: Optional. Der Server setzt die ID der angemeldeten EG ein. Eine fremde ID ergibt 403 FORBIDDEN.
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        intervalStart:
+          $ref: '#/components/schemas/IntervalStart'
+          description: Nur bei QUARTER_HOUR-Märkten, dort Pflicht. Bei DAY-Märkten nicht erlaubt.
+        type:
+          $ref: '#/components/schemas/PositionType'
+        quantityKwh:
+          $ref: '#/components/schemas/QuantityKwh'
+        priceExpectationEurPerKwh:
+          $ref: '#/components/schemas/PriceEurPerKwh'
+          description: 'Nur bei OFFER: Mindestpreis, zu dem die EG verkauft. Liegt er über buyPriceEurPerKwh, wird das Angebot
+            nicht gehandelt.'
+      if:
+        properties:
+          type:
+            const: DEMAND
+        required:
+        - type
+      then:
+        not:
+          required:
+          - priceExpectationEurPerKwh
+    PositionUpdate:
+      type: object
+      required:
+      - quantityKwh
+      additionalProperties: false
+      properties:
+        quantityKwh:
+          $ref: '#/components/schemas/QuantityKwh'
+        priceExpectationEurPerKwh:
+          $ref: '#/components/schemas/PriceEurPerKwh'
+    Position:
+      type: object
+      required:
+      - id
+      - energyCommunityId
+      - deliveryDate
+      - intervalStart
+      - type
+      - quantityKwh
+      - status
+      - createdAt
+      - updatedAt
+      properties:
+        id:
+          $ref: '#/components/schemas/PositionId'
+        energyCommunityId:
+          $ref: '#/components/schemas/EnergyCommunityId'
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        intervalStart:
+          $ref: '#/components/schemas/IntervalStartOrNull'
+        type:
+          $ref: '#/components/schemas/PositionType'
+        quantityKwh:
+          $ref: '#/components/schemas/QuantityKwh'
+        priceExpectationEurPerKwh:
+          $ref: '#/components/schemas/PriceEurPerKwh'
+        status:
+          $ref: '#/components/schemas/PositionStatus'
+        rejectionReason:
+          type:
+          - string
+          - 'null'
+          description: Nur bei REJECTED gesetzt, z. B. ENERGY_COMMUNITY_NOT_ACTIVE.
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    Market:
+      type: object
+      required:
+      - deliveryDate
+      - resolution
+      - status
+      - prices
+      - closesAt
+      properties:
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        resolution:
+          $ref: '#/components/schemas/MarketResolution'
+        status:
+          $ref: '#/components/schemas/MarketStatus'
+        prices:
+          $ref: '#/components/schemas/Prices'
+          description: Ab Marktöffnung bekannt und bis zum Settlement unverändert (Vorschlag).
+        closesAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Ab diesem Zeitpunkt werden keine Positionen mehr angenommen, geändert oder storniert.
+        closedAt:
+          oneOf:
+          - $ref: '#/components/schemas/Timestamp'
+          - type: 'null'
+        settledAt:
+          oneOf:
+          - $ref: '#/components/schemas/Timestamp'
+          - type: 'null'
+        failureReason:
+          type:
+          - string
+          - 'null'
+          description: Nur bei FAILED gesetzt.
+    Allocation:
+      type: object
+      required:
+      - deliveryDate
+      - intervalStart
+      - positionId
+      - energyCommunityId
+      - type
+      - requestedKwh
+      - allocatedKwh
+      - reason
+      properties:
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        intervalStart:
+          $ref: '#/components/schemas/IntervalStartOrNull'
+        positionId:
+          $ref: '#/components/schemas/PositionId'
+        energyCommunityId:
+          $ref: '#/components/schemas/EnergyCommunityId'
+        type:
+          $ref: '#/components/schemas/PositionType'
+        requestedKwh:
+          $ref: '#/components/schemas/QuantityKwh'
+        allocatedKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        reason:
+          $ref: '#/components/schemas/AllocationReason'
+    Trade:
+      type: object
+      required:
+      - id
+      - deliveryDate
+      - intervalStart
+      - positionId
+      - energyCommunityId
+      - direction
+      - fromReserve
+      - quantityKwh
+      - priceEurPerKwh
+      - amountEur
+      - createdAt
+      properties:
+        id:
+          $ref: '#/components/schemas/TradeId'
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        intervalStart:
+          $ref: '#/components/schemas/IntervalStartOrNull'
+        positionId:
+          $ref: '#/components/schemas/PositionId'
+          description: Position, aus der dieser Handelsabschluss entstanden ist.
+        energyCommunityId:
+          $ref: '#/components/schemas/EnergyCommunityId'
+        direction:
+          $ref: '#/components/schemas/TradeDirection'
+        fromReserve:
+          type: boolean
+          description: true, wenn die Menge eines Bedarfs aus der Reserve gedeckt wurde (nur bei PLATFORM_SELLS).
+        quantityKwh:
+          $ref: '#/components/schemas/QuantityKwh'
+        priceEurPerKwh:
+          $ref: '#/components/schemas/PriceEurPerKwh'
+        amountEur:
+          $ref: '#/components/schemas/AmountEur'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+    Prices:
+      type: object
+      required:
+      - deliveryDate
+      - buyPriceEurPerKwh
+      - sellPriceEurPerKwh
+      properties:
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        buyPriceEurPerKwh:
+          oneOf:
+          - $ref: '#/components/schemas/PriceEurPerKwh'
+          - type: 'null'
+        sellPriceEurPerKwh:
+          oneOf:
+          - $ref: '#/components/schemas/PriceEurPerKwh'
+          - type: 'null'
+        reservePriceEurPerKwh:
+          oneOf:
+          - $ref: '#/components/schemas/PriceEurPerKwh'
+          - type: 'null'
+    Reserve:
+      type: object
+      required:
+      - deliveryDate
+      - status
+      - requiredKwh
+      - dispatchedKwh
+      - costEur
+      properties:
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        status:
+          $ref: '#/components/schemas/ReserveStatus'
+        requiredKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          description: max(D - S, 0), S = Summe der handelbaren Angebote.
+        dispatchedKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        priceEurPerKwh:
+          oneOf:
+          - $ref: '#/components/schemas/PriceEurPerKwh'
+          - type: 'null'
+        costEur:
+          $ref: '#/components/schemas/AmountEur'
+    MarketResult:
+      type: object
+      required:
+      - deliveryDate
+      - resolution
+      - status
+      - settledAt
+      - totalOfferedKwh
+      - tradableOfferedKwh
+      - totalDemandKwh
+      - totalPurchasedKwh
+      - totalSoldKwh
+      - reserve
+      - prices
+      - purchaseCostEur
+      - salesRevenueEur
+      - marginEur
+      properties:
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        resolution:
+          $ref: '#/components/schemas/MarketResolution'
+        status:
+          $ref: '#/components/schemas/MarketStatus'
+        settledAt:
+          $ref: '#/components/schemas/Timestamp'
+        totalOfferedKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        tradableOfferedKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          description: Summe der Angebote, deren Preisvorstellung erfüllt ist (S).
+        totalDemandKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        totalPurchasedKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        totalSoldKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        reserve:
+          $ref: '#/components/schemas/Reserve'
+        prices:
+          $ref: '#/components/schemas/Prices'
+        purchaseCostEur:
+          $ref: '#/components/schemas/AmountEur'
+        salesRevenueEur:
+          $ref: '#/components/schemas/AmountEur'
+        marginEur:
+          $ref: '#/components/schemas/AmountEur'
+          description: salesRevenueEur - purchaseCostEur - reserve.costEur
+        intervals:
+          type: array
+          items:
+            $ref: '#/components/schemas/IntervalResult'
+          description: 'Nur bei QUARTER_HOUR: Ergebnis je Intervall. Die Felder auf oberster Ebene sind die Tagessummen.'
+    Health:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          enum:
+          - UP
+          - DOWN
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+            enum:
+            - UP
+            - DOWN
+          examples:
+          - database: UP
+    TradeId:
+      type: string
+      format: uuid
+      pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+      examples:
+      - 9d2e7a41-0c55-4b8e-9a3f-52c1d8e4f7b6
+    EnergyCommunityStatus:
+      type: string
+      enum:
+      - PENDING
+      - ACTIVE
+      - SUSPENDED
+    EnergyCommunityUpdate:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          pattern: \S
+        description:
+          type: string
+          minLength: 1
+          maxLength: 500
+      description: Profil bearbeiten. Der Status ist hier nicht erlaubt (nur PUT /energy-communities/{id}/status).
+    Me:
+      type: object
+      required:
+      - role
+      properties:
+        role:
+          type: string
+          enum:
+          - ADMIN
+          - ENERGY_COMMUNITY
+        energyCommunity:
+          $ref: '#/components/schemas/EnergyCommunity'
+    EnergyCommunityRegistration:
+      type: object
+      required:
+      - email
+      - name
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          pattern: \S
+        description:
+          type: string
+          minLength: 1
+          maxLength: 500
+    LoginRequest:
+      type: object
+      required:
+      - email
+      - password
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+    LoginResponse:
+      type: object
+      required:
+      - token
+      - tokenType
+      - expiresIn
+      - role
+      properties:
+        token:
+          type: string
+        tokenType:
+          type: string
+          const: Bearer
+        expiresIn:
+          type: integer
+          minimum: 1
+          description: Gültigkeit in Sekunden
+        role:
+          type: string
+          enum:
+          - ADMIN
+          - ENERGY_COMMUNITY
+        energyCommunity:
+          $ref: '#/components/schemas/EnergyCommunity'
+    Credentials:
+      type: object
+      required:
+      - apiKey
+      - password
+      properties:
+        apiKey:
+          type: string
+        password:
+          type: string
+    MarketResolution:
+      type: string
+      enum:
+      - DAY
+      - QUARTER_HOUR
+      description: Zeitliche Auflösung des Markts (Vorschlag). DAY = ein Intervall pro Liefertag, QUARTER_HOUR = 15-Minuten-Intervalle.
+    IntervalStart:
+      type: string
+      format: date-time
+      pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:(00|15|30|45):00(\.0+)?Z$
+      description: Beginn des 15-Minuten-Intervalls in UTC (nur bei QUARTER_HOUR).
+      examples:
+      - '2026-11-20T11:15:00Z'
+    IntervalStartOrNull:
+      oneOf:
+      - $ref: '#/components/schemas/IntervalStart'
+      - type: 'null'
+      description: Beginn des Lieferintervalls; null im Tagesmarkt (DAY).
+    AllocationReason:
+      type: string
+      enum:
+      - FULLY_ALLOCATED
+      - PARTIALLY_ALLOCATED
+      - PRICE_NOT_MET
+      - NOT_NEEDED
+      - RESERVE_SHORTAGE
+      description: 'Warum die Zuteilung so ausfällt (Vorschlag). FULLY_ALLOCATED: volle Menge. PARTIALLY_ALLOCATED: Angebot
+        pro rata gekürzt, weil handelbare Angebote den Bedarf übersteigen. PRICE_NOT_MET: Preisvorstellung über buyPriceEurPerKwh,
+        nicht gehandelt. NOT_NEEDED: kein Bedarf vorhanden. RESERVE_SHORTAGE: Bedarf gekürzt, weil die Reserve nicht reicht.'
+    IntervalResult:
+      type: object
+      required:
+      - intervalStart
+      - totalOfferedKwh
+      - tradableOfferedKwh
+      - totalDemandKwh
+      - totalPurchasedKwh
+      - totalSoldKwh
+      - reserve
+      properties:
+        intervalStart:
+          $ref: '#/components/schemas/IntervalStart'
+        totalOfferedKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        tradableOfferedKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        totalDemandKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        totalPurchasedKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        totalSoldKwh:
+          $ref: '#/components/schemas/QuantityKwhNonNegative'
+        reserve:
+          $ref: '#/components/schemas/Reserve'
+    EnergyCommunityStatusUpdate:
+      type: object
+      required:
+      - status
+      additionalProperties: false
+      properties:
+        status:
+          $ref: '#/components/schemas/EnergyCommunityStatus'
+  examples:
+    VALIDATION_FAILED:
+      summary: 400 VALIDATION_FAILED
+      value:
+        code: VALIDATION_FAILED
+        message: At least one field is invalid.
+        details:
+        - field: /quantityKwh
+          code: INVALID_QUANTITY
+          message: quantityKwh must be greater than 0.
+    INVALID_ID:
+      summary: 400 INVALID_ID
+      value:
+        code: INVALID_ID
+        message: The ID is not a valid UUID.
+    INVALID_DELIVERY_DATE:
+      summary: 400 INVALID_DELIVERY_DATE
+      value:
+        code: INVALID_DELIVERY_DATE
+        message: deliveryDate must be in the format YYYY-MM-DD.
+    INVALID_INTERVAL:
+      summary: 400 INVALID_INTERVAL
+      value:
+        code: INVALID_INTERVAL
+        message: intervalStart is missing, not allowed or not a quarter hour of the delivery day.
+    INVALID_POSITION_TYPE:
+      summary: 400 INVALID_POSITION_TYPE
+      value:
+        code: INVALID_POSITION_TYPE
+        message: type must be OFFER or DEMAND.
+    INVALID_QUANTITY:
+      summary: 400 INVALID_QUANTITY
+      value:
+        code: INVALID_QUANTITY
+        message: quantityKwh must be greater than 0 (max. 3 decimal places).
+    INVALID_PRICE:
+      summary: 400 INVALID_PRICE
+      value:
+        code: INVALID_PRICE
+        message: The price must be between 0 and 100 EUR/kWh (max. 5 decimal places).
+    UNAUTHORIZED:
+      summary: 401 UNAUTHORIZED
+      value:
+        code: UNAUTHORIZED
+        message: API key or token is missing, invalid or expired.
+    INVALID_CREDENTIALS:
+      summary: 401 INVALID_CREDENTIALS
+      value:
+        code: INVALID_CREDENTIALS
+        message: Email or password is wrong.
+    FORBIDDEN:
+      summary: 403 FORBIDDEN
+      value:
+        code: FORBIDDEN
+        message: You are not allowed to access this resource or perform this action.
+    FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
+      summary: 403 FORBIDDEN (fremde energyCommunityId)
+      value:
+        code: FORBIDDEN
+        message: energyCommunityId does not belong to the authenticated energy community.
+    ENERGY_COMMUNITY_NOT_ACTIVE:
+      summary: 403 ENERGY_COMMUNITY_NOT_ACTIVE
+      value:
+        code: ENERGY_COMMUNITY_NOT_ACTIVE
+        message: The energy community is not active (pending approval or suspended).
+    ENERGY_COMMUNITY_NOT_FOUND:
+      summary: 404 ENERGY_COMMUNITY_NOT_FOUND
+      value:
+        code: ENERGY_COMMUNITY_NOT_FOUND
+        message: The energy community does not exist.
+    POSITION_NOT_FOUND:
+      summary: 404 POSITION_NOT_FOUND
+      value:
+        code: POSITION_NOT_FOUND
+        message: The position does not exist.
+    MARKET_NOT_FOUND:
+      summary: 404 MARKET_NOT_FOUND
+      value:
+        code: MARKET_NOT_FOUND
+        message: No market exists for the delivery date.
+    EMAIL_ALREADY_REGISTERED:
+      summary: 409 EMAIL_ALREADY_REGISTERED
+      value:
+        code: EMAIL_ALREADY_REGISTERED
+        message: An energy community with this email is already registered.
+    ENERGY_COMMUNITY_IN_USE:
+      summary: 409 ENERGY_COMMUNITY_IN_USE
+      value:
+        code: ENERGY_COMMUNITY_IN_USE
+        message: The energy community cannot be deleted because it has positions or trades.
+    INVALID_STATUS_TRANSITION:
+      summary: 409 INVALID_STATUS_TRANSITION
+      value:
+        code: INVALID_STATUS_TRANSITION
+        message: This status change is not allowed.
+    POSITION_ALREADY_EXISTS:
+      summary: 409 POSITION_ALREADY_EXISTS
+      value:
+        code: POSITION_ALREADY_EXISTS
+        message: A position already exists for this energy community, delivery date and interval.
+    POSITION_NOT_MODIFIABLE:
+      summary: 409 POSITION_NOT_MODIFIABLE
+      value:
+        code: POSITION_NOT_MODIFIABLE
+        message: The position is cancelled or already processed and can no longer be changed.
+    MARKET_CLOSED:
+      summary: 409 MARKET_CLOSED
+      value:
+        code: MARKET_CLOSED
+        message: The market is already closed.
+    MARKET_NOT_SETTLED:
+      summary: 409 MARKET_NOT_SETTLED
+      value:
+        code: MARKET_NOT_SETTLED
+        message: The market result is not available yet.
+    DELIVERY_DATE_IN_PAST:
+      summary: 422 DELIVERY_DATE_IN_PAST
+      value:
+        code: DELIVERY_DATE_IN_PAST
+        message: The delivery date is in the past.
+    INTERNAL_ERROR:
+      summary: 500 INTERNAL_ERROR
+      value:
+        code: INTERNAL_ERROR
+        message: Internal error.
