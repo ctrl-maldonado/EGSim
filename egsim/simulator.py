@@ -356,6 +356,12 @@ class Simulator:
             problems.append(f"status={m.get('status')}")
         if not isinstance(m.get("prices"), dict):
             problems.append("prices fehlt")
+        else:
+            # Vertrag 0.2 (korrigiert 19.11.): ab Marktöffnung sind alle drei Preise gesetzt, nie null
+            for f in ("buyPriceEurPerKwh", "sellPriceEurPerKwh", "reservePriceEurPerKwh"):
+                v = m["prices"].get(f)
+                if v is None or isinstance(v, bool) or not isinstance(v, (int, float, Decimal)):
+                    problems.append(f"prices.{f}={v!r} (Pflicht, Zahl)")
         if not m.get("closesAt"):
             problems.append("closesAt fehlt")
         if problems:
@@ -372,23 +378,30 @@ class Simulator:
             cur = reader.get_market(run.delivery_date)
             run.final_status = (cur.body or {}).get("status") if cur.status == 200 else run.final_status
 
+    def _check_close_status(self, r: ApiResponse) -> str | None:
+        """Vertrag 0.2 (korrigiert 19.11.): jede close-Antwort, auch eine Wiederholung, ist 200 bei SETTLED
+        und 202 bei CLOSED."""
+        status = (r.body or {}).get("status") if isinstance(r.body, dict) else None
+        if r.status == 200 and status != "SETTLED":
+            self.findings.error("close", f"close antwortet 200, Status aber {status} (erwartet SETTLED)", r.short())
+        if r.status == 202 and status != "CLOSED":
+            self.findings.error("close", f"close antwortet 202, Status aber {status} (erwartet CLOSED)", r.short())
+        return status
+
     def _close(self, run: MarketRun) -> None:
         n = max(1, self.cfg.parallel_close)
         if n > 1:  # gleichzeitige close-Aufrufe: genau ein Settlement, alle Antworten 200/202
             with ThreadPoolExecutor(n) as ex:
                 answers = list(ex.map(lambda _: self.admin.close_market(run.delivery_date), range(n)))
             for a in answers[1:]:
-                self._expect(a, (200, 202), "close", f"Admin: paralleler close-Aufruf für {run.delivery_date}")
+                if self._expect(a, (200, 202), "close", f"Admin: paralleler close-Aufruf für {run.delivery_date}"):
+                    self._check_close_status(a)
             r = answers[0]
         else:
             r = self.admin.close_market(run.delivery_date)
         if not self._expect(r, (200, 202), "close", f"Admin: Markt {run.delivery_date} schließen"):
             return
-        status = (r.body or {}).get("status")
-        if r.status == 200 and status != "SETTLED":
-            self.findings.error("close", f"close antwortet 200, Status aber {status} (erwartet SETTLED)", r.short())
-        if r.status == 202 and status != "CLOSED":
-            self.findings.error("close", f"close antwortet 202, Status aber {status} (erwartet CLOSED)", r.short())
+        status = self._check_close_status(r)
         deadline = time.monotonic() + max(60.0, self.cfg.wait_for_settlement_minutes * 60)
         while status not in ("SETTLED", "FAILED") and time.monotonic() < deadline:
             if self.stop.wait(1):

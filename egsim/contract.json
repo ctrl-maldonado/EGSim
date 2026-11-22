@@ -1233,6 +1233,7 @@
   },
   "PositionUpdate": {
    "additionalProperties": false,
+   "description": "Der Server prüft den Typ der bereits gespeicherten Position: priceExpectationEurPerKwh ist nur bei OFFER zulässig. Bei DEMAND und übergebenem Preisfeld: 400 VALIDATION_FAILED; die Position bleibt unverändert. Diese Regel hängt von der gespeicherten Ressource ab und kann nicht allein durch das Request-Schema validiert werden.",
    "properties": {
     "priceExpectationEurPerKwh": {
      "$ref": "#/components/schemas/PriceEurPerKwh"
@@ -1258,43 +1259,23 @@
   "Prices": {
    "properties": {
     "buyPriceEurPerKwh": {
-     "oneOf": [
-      {
-       "$ref": "#/components/schemas/PriceEurPerKwh"
-      },
-      {
-       "type": "null"
-      }
-     ]
+     "$ref": "#/components/schemas/PriceEurPerKwh"
     },
     "deliveryDate": {
      "$ref": "#/components/schemas/DeliveryDate"
     },
     "reservePriceEurPerKwh": {
-     "oneOf": [
-      {
-       "$ref": "#/components/schemas/PriceEurPerKwh"
-      },
-      {
-       "type": "null"
-      }
-     ]
+     "$ref": "#/components/schemas/PriceEurPerKwh"
     },
     "sellPriceEurPerKwh": {
-     "oneOf": [
-      {
-       "$ref": "#/components/schemas/PriceEurPerKwh"
-      },
-      {
-       "type": "null"
-      }
-     ]
+     "$ref": "#/components/schemas/PriceEurPerKwh"
     }
    },
    "required": [
     "deliveryDate",
     "buyPriceEurPerKwh",
-    "sellPriceEurPerKwh"
+    "sellPriceEurPerKwh",
+    "reservePriceEurPerKwh"
    ],
    "type": "object"
   },

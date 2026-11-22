@@ -354,10 +354,27 @@ def _put_validation_checks(c: Checker, sim: "Simulator", run: "MarketRun") -> No
         c.skip("POS-06", "PUT mit ungültigem Preis", "kein offenes Angebot vorhanden")
     demand = next((x for x in live if x.planned.type == "DEMAND"), None)
     if demand:
-        c.run("POS-08", "PUT eines Bedarfs mit Preisvorstellung → 400 VALIDATION_FAILED",
-              lambda: demand.eg.client.update_position(demand.id, {"quantityKwh": demand.quantity,
+        # Vertrag 0.2 (korrigiert 19.11.): 400 VALIDATION_FAILED und die Position bleibt unverändert.
+        # Andere Menge mitschicken, damit eine trotz 400 gespeicherte Teiländerung auffällt.
+        new_qty = demand.quantity + 1 if demand.quantity + 1 <= Decimal(1_000_000) else demand.quantity - Decimal("0.5")
+
+        def demand_unchanged(_r: ApiResponse) -> str | None:
+            g = demand.eg.client.get_position(demand.id)
+            if g.status != 200 or not isinstance(g.body, dict):
+                return f"Position danach nicht abrufbar ({g.status})"
+            problems = []
+            if Decimal(str(g.body.get("quantityKwh"))) != demand.quantity:
+                problems.append(f"quantityKwh {demand.quantity} → {g.body.get('quantityKwh')}")
+            if g.body.get("priceExpectationEurPerKwh") is not None:
+                problems.append(f"priceExpectationEurPerKwh gesetzt ({g.body.get('priceExpectationEurPerKwh')})")
+            if problems:
+                restore(demand)(g)
+                return "400 gemeldet, aber Position geändert: " + "; ".join(problems)
+            return None
+        c.run("POS-08", "PUT eines Bedarfs mit Preisvorstellung → 400 VALIDATION_FAILED, Position unverändert",
+              lambda: demand.eg.client.update_position(demand.id, {"quantityKwh": new_qty,
                                                                    "priceExpectationEurPerKwh": Decimal("0.1")}),
-              [_err(400, "VALIDATION_FAILED")], on_unexpected_success=restore(demand))
+              [_err(400, "VALIDATION_FAILED")], on_unexpected_success=restore(demand), extra=demand_unchanged)
     else:
         c.skip("POS-08", "PUT eines Bedarfs mit Preisvorstellung", "kein offener Bedarf vorhanden")
 

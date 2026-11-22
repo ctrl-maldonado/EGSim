@@ -39,6 +39,16 @@ info:
     Der Markt wird weiterhin einmal pro Liefertag geschlossen. Matching, Teilzuteilung und Reserve werden aber für jedes Intervall einzeln berechnet.
     Zuteilungen und Handelsabschlüsse enthalten `intervalStart`, das Tagesergebnis enthält zusätzlich `intervals`.
 
+    ## Marktanlage und Preiskonfiguration (Betreiberprozess)
+    Der Betreiber legt einen Markt pro `deliveryDate` vor der Annahme von Positionen außerhalb dieser API an,
+    z. B. über Deployment-Konfiguration oder einen betrieblichen Initialisierungsprozess. Dazu werden
+    `resolution` (`DAY` oder `QUARTER_HOUR`), `closesAt` und die drei Preise
+    (`buyPriceEurPerKwh`, `sellPriceEurPerKwh`, `reservePriceEurPerKwh`) vollständig konfiguriert.
+    Ein Markt wird erst nach erfolgreicher Konfiguration als `OPEN` bereitgestellt; bis dahin antworten
+    `GET /markets/{deliveryDate}` und `POST /positions` mit `404 MARKET_NOT_FOUND`.
+    Ab Marktöffnung bleiben Auflösung und Preise unverändert. Die konkrete Implementierung der Marktanlage
+    und Preiskonfiguration ist ein Betreiberprozess und nicht Bestandteil dieser öffentlichen API.
+
     ## Handels- und Preislogik (Vorschlag)
     Die Plattform ist Gegenpartei aller Geschäfte. Sie kauft von anbietenden EGs (`PLATFORM_BUYS`) und verkauft an nachfragende EGs (`PLATFORM_SELLS`).
     Fehlende Mengen kauft sie als Reserve beim Kraftwerk zu.
@@ -97,8 +107,8 @@ info:
     | `FAILED` | `CLOSED` | Admin ruft `close` erneut auf (neuer Versuch) |
 
     - Ab `closesAt` lehnt der Server neue, geänderte und stornierte Positionen mit `409 MARKET_CLOSED` ab, auch wenn der Admin den Markt noch nicht geschlossen hat.
-    - `close` ist idempotent: Bei `CLOSED` oder `SETTLED` wird nichts neu berechnet.
-    - `close` antwortet mit `200`, wenn das Settlement fertig ist (`SETTLED`), und mit `202`, wenn es noch läuft (`CLOSED`). Dann `GET /markets/{deliveryDate}` abfragen, bis der Status `SETTLED` oder `FAILED` ist.
+    - `close` ist idempotent: Bei `CLOSED` oder `SETTLED` wird nichts neu berechnet. Bei `FAILED` startet ein erneuter Aufruf einen neuen Versuch.
+    - `close` antwortet immer mit `200` bei `SETTLED` (auch bei erneutem Aufruf) und mit `202` bei `CLOSED` (auch bei erneutem Aufruf während des laufenden Settlements). Beim neuen Versuch nach `FAILED` gilt dieselbe Regel: `200` bei bereits abgeschlossenem, `202` bei noch laufendem Settlement. Bei `202` anschließend `GET /markets/{deliveryDate}` abfragen, bis der Status `SETTLED` oder `FAILED` ist.
     - Ergebnisse (`/result`, `/allocations`, `/trades`) gibt es nur bei `SETTLED`, sonst `409 MARKET_NOT_SETTLED`. `SETTLED` ist endgültig.
 
     Position:
@@ -1245,7 +1255,7 @@ paths:
       - Positions
       summary: Position ändern
       description: 'Rollen: Nur ENERGY_COMMUNITY (nur eigene Daten). Nur eigene Positionen mit Status OPEN, solange der Markt
-        offen ist.'
+        offen ist. priceExpectationEurPerKwh darf nur bei einer gespeicherten OFFER-Position geändert werden; bei DEMAND mit diesem Feld: 400 VALIDATION_FAILED, keine Änderung.'
       operationId: updatePosition
       x-roles: *id005
       requestBody:
@@ -1519,12 +1529,12 @@ paths:
       - Markets
       summary: Markt schließen und abwickeln
       description: 'Rollen: Nur ADMIN. Schließt den Markt und startet das Settlement (siehe Statusübergänge). Idempotent:
-        Bei CLOSED oder SETTLED wird nichts neu berechnet. Bei FAILED startet ein neuer Versuch.'
+        Bei CLOSED oder SETTLED wird nichts neu berechnet. Bei FAILED startet ein neuer Versuch. Rückgabe: 200 bei SETTLED, 202 bei CLOSED, auch bei Wiederholungsaufrufen.'
       operationId: closeMarket
       x-roles: *id004
       responses:
         '200':
-          description: Settlement abgeschlossen (SETTLED), oder der Markt war schon geschlossen
+          description: Markt ist SETTLED (Settlement abgeschlossen; auch bei wiederholtem Aufruf)
           content:
             application/json:
               schema:
@@ -1542,7 +1552,7 @@ paths:
                     settledAt: '2026-11-19T11:00:05Z'
                     failureReason: null
         '202':
-          description: Markt geschlossen (CLOSED), Settlement läuft noch
+          description: Markt ist CLOSED (Settlement läuft; auch bei wiederholtem Aufruf)
           content:
             application/json:
               schema:
@@ -2332,6 +2342,7 @@ components:
           - priceExpectationEurPerKwh
     PositionUpdate:
       type: object
+      description: 'Der Server prüft den Typ der bereits gespeicherten Position: priceExpectationEurPerKwh ist nur bei OFFER zulässig. Bei DEMAND und übergebenem Preisfeld: 400 VALIDATION_FAILED; die Position bleibt unverändert. Diese Regel hängt von der gespeicherten Ressource ab und kann nicht allein durch das Request-Schema validiert werden.'
       required:
       - quantityKwh
       additionalProperties: false
@@ -2485,21 +2496,16 @@ components:
       - deliveryDate
       - buyPriceEurPerKwh
       - sellPriceEurPerKwh
+      - reservePriceEurPerKwh
       properties:
         deliveryDate:
           $ref: '#/components/schemas/DeliveryDate'
         buyPriceEurPerKwh:
-          oneOf:
-          - $ref: '#/components/schemas/PriceEurPerKwh'
-          - type: 'null'
+          $ref: '#/components/schemas/PriceEurPerKwh'
         sellPriceEurPerKwh:
-          oneOf:
-          - $ref: '#/components/schemas/PriceEurPerKwh'
-          - type: 'null'
+          $ref: '#/components/schemas/PriceEurPerKwh'
         reservePriceEurPerKwh:
-          oneOf:
-          - $ref: '#/components/schemas/PriceEurPerKwh'
-          - type: 'null'
+          $ref: '#/components/schemas/PriceEurPerKwh'
     Reserve:
       type: object
       required:
