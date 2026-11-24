@@ -14,6 +14,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Callable
 
 from egsim.client import ApiClient, ApiResponse
+from egsim.settlement import D
 from egsim.timeutil import day_bounds_utc, format_utc, normalize_interval, quarter_hours, resolve_delivery_date
 
 if TYPE_CHECKING:
@@ -204,13 +205,11 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
           [_err(400, "INVALID_POSITION_TYPE")], on_unexpected_success=cleanup)
     c.run("VAL-12", "deliveryDate falsches Format → 400 INVALID_DELIVERY_DATE", post(body(deliveryDate="20.11.2026")),
           [_err(400, "INVALID_DELIVERY_DATE")], on_unexpected_success=cleanup)
-    c.run("VAL-13", "deliveryDate in der Vergangenheit → 422 DELIVERY_DATE_IN_PAST",
+    # 0.3 (B1): Das Kalenderdatum ist kein Ablehnungsgrund, nur der Markt zählt. Ohne Markt also 404, kein 422.
+    c.run("VAL-13", "Vergangener Liefertag ohne Markt → 404 MARKET_NOT_FOUND (kein 422)",
           post(body(deliveryDate="2020-01-01",
                     intervalStart=_DROP if res == "DAY" else format_utc(quarter_hours(resolve_delivery_date("2020-01-01"))[48]))),
-          [_err(422, "DELIVERY_DATE_IN_PAST"), _err(404, "MARKET_NOT_FOUND")],
-          note_on={(404, "MARKET_NOT_FOUND"): "404 statt 422: Vertrag regelt nicht, ob 404 (kein Markt) oder 422 "
-                                              "(Vergangenheit) Vorrang hat – Reihenfolge 404 vor 422 spricht für 404"},
-          on_unexpected_success=cleanup)
+          [_err(404, "MARKET_NOT_FOUND")], on_unexpected_success=cleanup)
     c.run("VAL-14", "Kaputtes JSON → 400 VALIDATION_FAILED",
           lambda: cl.call("POST", "/positions", raw_body='{"deliveryDate": "' + d + '", '), [_err(400, "VALIDATION_FAILED")])
     c.run("VAL-15", "Fremde, ungültige energyCommunityId → 400 INVALID_ID", post(body(energyCommunityId="xyz")),
@@ -252,8 +251,10 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
         ccl = cancelled.eg.client
         c.run("STATE-05", "Stornierte Position ändern → 409 POSITION_NOT_MODIFIABLE",
               lambda: ccl.update_position(cancelled.id, {"quantityKwh": Decimal(1)}), [_err(409, "POSITION_NOT_MODIFIABLE")])
-        c.run("STATE-06", "Stornierte Position erneut stornieren → 409 POSITION_NOT_MODIFIABLE",
-              lambda: ccl.cancel_position(cancelled.id), [_err(409, "POSITION_NOT_MODIFIABLE")])
+        c.run("STATE-06", "Stornierte Position erneut stornieren → 200 ohne Änderung (idempotent)",
+              lambda: ccl.cancel_position(cancelled.id), [_err(200)],
+              extra=lambda r: None if (r.body or {}).get("status") == "CANCELLED"
+              else f"Status {(r.body or {}).get('status')} statt CANCELLED")
     else:
         c.skip("STATE-05", "Stornierte Position ändern", "keine stornierte Position (behaviour.cancelProbability = 0)")
 
@@ -266,6 +267,8 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
 
     _put_validation_checks(c, sim, run)
     _filter_checks_open(c, sim, run, sp_a)
+    _idempotency_checks(c, sim, run, sp_a, base)
+    _request_id_checks(c, sim, run, cl)
 
     # --- Mandantentrennung (zweite EG nötig)
     if not sp_b:
@@ -295,6 +298,79 @@ def run_open_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
     c.run("TEN-10", "Trade-Filter auf fremde EG → 403", lambda: cl.trades(d, energyCommunityId=other.id),
           [_err(403, "FORBIDDEN")])
     return c.results
+
+
+def _idempotency_checks(c: Checker, sim: "Simulator", run: "MarketRun", sp_a: "SubmittedPosition", base: dict) -> None:
+    """Vertrag 0.3 (B2): Idempotency-Key ist bei POST /positions Pflicht. Prüfreihenfolge: Idempotenz vor 400 und 409."""
+    cl = sp_a.eg.client
+    cleanup = _cleanup(sim, cl)
+    c.run("IDEM-01", "POST /positions ohne Idempotency-Key → 400 VALIDATION_FAILED",
+          lambda: cl.submit_position(dict(base), idempotency_key=""), [_err(400, "VALIDATION_FAILED")],
+          on_unexpected_success=cleanup)
+    c.run("IDEM-02", "Idempotency-Key ist keine UUID → 400 VALIDATION_FAILED",
+          lambda: cl.submit_position(dict(base), idempotency_key="nicht-eine-uuid"), [_err(400, "VALIDATION_FAILED")],
+          on_unexpected_success=cleanup)
+    sp = next((x for x in run.positions if x.id and x.idempotency_key and x.submitted_body and x.eg.ready
+               and x.status == "OPEN"), None)
+    if not sp:
+        c.skip("IDEM-03", "Wiederholung mit gleichem Key", "keine selbst eingereichte Position mit bekanntem Key")
+        return
+
+    def same_position(r: ApiResponse) -> str | None:
+        b = r.body if isinstance(r.body, dict) else {}
+        return None if b.get("id") == sp.id else f"neue Position {b.get('id')} statt der ersten ({sp.id})"
+    c.run("IDEM-03", "Gleicher Key, gleicher Inhalt → gespeicherte Antwort 201 mit derselben Position",
+          lambda: sp.eg.client.submit_position(dict(sp.submitted_body), idempotency_key=sp.idempotency_key),
+          [_err(201)], extra=same_position)
+    changed = {**sp.submitted_body, "quantityKwh": D(sp.submitted_body["quantityKwh"]) + 1}
+    c.run("IDEM-04", "Gleicher Key, anderer Inhalt → 409 IDEMPOTENCY_KEY_REUSED",
+          lambda: sp.eg.client.submit_position(changed, idempotency_key=sp.idempotency_key),
+          [_err(409, "IDEMPOTENCY_KEY_REUSED")], on_unexpected_success=_cleanup(sim, sp.eg.client))
+    reordered = dict(reversed(list(sp.submitted_body.items())))
+    c.run("IDEM-05", "Gleicher Key, Felder in anderer Reihenfolge → gleiche Antwort 201",
+          lambda: sp.eg.client.submit_position(reordered, idempotency_key=sp.idempotency_key),
+          [_err(201)], extra=same_position)
+
+
+def _request_id_checks(c: Checker, sim: "Simulator", run: "MarketRun", cl: ApiClient) -> None:
+    """Vertrag 0.3 (A3): X-Request-Id in jeder Antwort, requestId im Fehler mit demselben Wert; GET /markets (W1)."""
+    rid = f"egsim-{uuid.uuid4().hex}"
+
+    def echoed(r: ApiResponse) -> str | None:
+        if r.headers.get("x-request-id") != rid:
+            return f"Header X-Request-Id {r.headers.get('x-request-id')!r} statt der gesendeten ID"
+        if (r.body or {}).get("requestId") != rid:
+            return f"requestId {(r.body or {}).get('requestId')!r} statt der gesendeten ID"
+        return None
+    c.run("REQ-01", "Fehlerantwort mit eigener X-Request-Id → gleiche ID in Header und requestId",
+          lambda: cl.call("GET", "/markets/{deliveryDate}", path_params={"deliveryDate": "2099-12-31"},
+                          headers={"X-Request-Id": rid}), [_err(404, "MARKET_NOT_FOUND")], extra=echoed)
+
+    def own_rid(r: ApiResponse) -> str | None:
+        got = r.headers.get("x-request-id")
+        if not got:
+            return "Header X-Request-Id fehlt"
+        if (r.body or {}).get("requestId") != got:
+            return f"requestId {(r.body or {}).get('requestId')!r} ≠ Header {got!r}"
+        return None
+    c.run("REQ-02", "Ohne X-Request-Id → Server erzeugt eine ID (Header und requestId)",
+          lambda: cl.call("GET", "/markets/{deliveryDate}", path_params={"deliveryDate": "2099-12-31"},
+                          headers={"X-Request-Id": None}), [_err(404, "MARKET_NOT_FOUND")], extra=own_rid)
+    d = run.delivery_date
+    open_now = (run.market or {}).get("status") == "OPEN"
+
+    def open_list(r: ApiResponse) -> str | None:
+        rows = r.body if isinstance(r.body, list) else []
+        bad = [x.get("deliveryDate") for x in rows if x.get("status") != "OPEN"]
+        if bad:
+            return f"Märkte mit anderem Status in der Liste: {', '.join(map(str, bad))}"
+        if open_now and not any(x.get("deliveryDate") == d for x in rows):
+            return f"offener Markt {d} fehlt"
+        return None
+    c.run("MKT-01", "GET /markets?status=OPEN → nur offene Märkte, der aktuelle ist dabei",
+          lambda: cl.list_markets("OPEN"), [_err(200)], extra=open_list)
+    c.run("MKT-02", "GET /markets mit ungültigem status → 400 VALIDATION_FAILED", lambda: cl.list_markets("FOO"),
+          [_err(400, "VALIDATION_FAILED")])
 
 
 class _Drop:
@@ -530,6 +606,12 @@ def run_closed_market_checks(sim: "Simulator", run: "MarketRun") -> list[dict]:
     c.run("CLOSED-03", "Position nach Marktschluss stornieren → 409", lambda: cl.cancel_position(sp.id),
           [_err(409, "MARKET_CLOSED", "POSITION_NOT_MODIFIABLE")])
     c.run("CLOSED-04", "EG schließt Markt → 403", lambda: cl.close_market(d), [_err(403, "FORBIDDEN")])
+    rp = next((x for x in live if x.idempotency_key and x.submitted_body and x.eg.ready), None)
+    if rp:
+        c.run("CLOSED-IDEM", "Wiederholung der ersten Einreichung nach Marktschluss → dieselbe 201 (0.3.1, K3)",
+              lambda: rp.eg.client.submit_position(dict(rp.submitted_body), idempotency_key=rp.idempotency_key),
+              [_err(201)], extra=lambda r: None if (r.body or {}).get("id") == rp.id
+              else f"Position {(r.body or {}).get('id')} statt {rp.id}")
     if run.final_status == "SETTLED":
         c.run("CLOSED-05", "Position nach Settlement ist PROCESSED", lambda: cl.get_position(sp.id), [_err(200)],
               extra=lambda r: None if (r.body or {}).get("status") == "PROCESSED"
@@ -575,20 +657,27 @@ def run_account_checks(sim: "Simulator") -> list[dict]:
     else:
         c.skip("AUTH-06", "Login-Checks", "keine EG mit E-Mail und Passwort hinterlegt")
 
+    _rate_limit_check(c, sim)
     if not sim.cfg.registration_checks:
         c.skip("REG-*", "Registrierungs-Checks", "abgeschaltet (legen eine PENDING-Test-EG auf der Plattform an)")
         return c.results
     email = f"egsim-regtest-{sim.run_id}@egsim.example"
+    code = f"egsim-reg-{rnd}"
     c.run("REG-01", "Registrierung mit ungültiger E-Mail → 400 VALIDATION_FAILED",
-          lambda: anon.register("keine-email", "EGSim Test"), [_err(400, "VALIDATION_FAILED")])
+          lambda: anon.register("keine-email", "EGSim Test", community_code=code + "-a"), [_err(400, "VALIDATION_FAILED")])
     c.run("REG-02", "Registrierung mit Feld status → 400 VALIDATION_FAILED",
           lambda: anon.call("POST", "/energy-communities", auth=False,
-                            json_body={"email": "x-" + email, "name": "EGSim", "status": "ACTIVE"}),
+                            json_body={"email": "x-" + email, "name": "EGSim", "communityCode": code + "-b",
+                                       "status": "ACTIVE"}),
           [_err(400, "VALIDATION_FAILED")])
-    c.run("REG-03", "Registrierung mit leerem Namen → 400 VALIDATION_FAILED", lambda: anon.register("y-" + email, "   "),
-          [_err(400, "VALIDATION_FAILED")])
-    c.run("REG-04", "Name mit 121 Zeichen → 400 VALIDATION_FAILED", lambda: anon.register("z-" + email, "N" * 121),
-          [_err(400, "VALIDATION_FAILED")])
+    c.run("REG-03", "Registrierung mit leerem Namen → 400 VALIDATION_FAILED",
+          lambda: anon.register("y-" + email, "   ", community_code=code + "-c"), [_err(400, "VALIDATION_FAILED")])
+    c.run("REG-04", "Name mit 121 Zeichen → 400 VALIDATION_FAILED",
+          lambda: anon.register("z-" + email, "N" * 121, community_code=code + "-d"), [_err(400, "VALIDATION_FAILED")])
+    c.run("REG-09", "Registrierung ohne communityCode → 400 VALIDATION_FAILED",
+          lambda: anon.register("w-" + email, "EGSim Test"), [_err(400, "VALIDATION_FAILED")])
+    c.run("REG-10", "communityCode mit Großbuchstaben → 400 VALIDATION_FAILED",
+          lambda: anon.register("v-" + email, "EGSim Test", community_code="EG-Gross"), [_err(400, "VALIDATION_FAILED")])
 
     def pending(r: ApiResponse) -> str | None:
         b = r.body if isinstance(r.body, dict) else {}
@@ -597,20 +686,56 @@ def run_account_checks(sim: "Simulator") -> list[dict]:
         if not b.get("id") or "apiKey" in b or "password" in b:
             return "id fehlt oder Antwort enthält Zugangsdaten"
         return None
-    r = c.run("REG-05", "Registrierung → 201 PENDING", lambda: anon.register(email, f"EGSim Registrierungstest {rnd}",
-                                                                           "Von EGSim angelegt, kann gelöscht werden"),
-              [_err(201)], extra=pending)
+    reg_key = str(uuid.uuid4())
+
+    def pending_with_code(r: ApiResponse) -> str | None:
+        return pending(r) or (None if (r.body or {}).get("communityCode") == code
+                              else f"communityCode {(r.body or {}).get('communityCode')!r} statt {code!r}")
+    r = c.run("REG-05", "Registrierung → 201 PENDING mit communityCode",
+              lambda: anon.register(email, f"EGSim Registrierungstest {rnd}", "Von EGSim angelegt, kann gelöscht werden",
+                                    community_code=code, idempotency_key=reg_key),
+              [_err(201)], extra=pending_with_code)
     if r and r.status == 201:
-        c.run("REG-06", "Gleiche E-Mail erneut → 409 EMAIL_ALREADY_REGISTERED", lambda: anon.register(email, "Doppelt"),
-              [_err(409, "EMAIL_ALREADY_REGISTERED")])
+        first_id = r.body.get("id")
+        c.run("REG-11", "Registrierung mit gleichem Idempotency-Key wiederholen → dieselbe 201",
+              lambda: anon.register(email, f"EGSim Registrierungstest {rnd}", "Von EGSim angelegt, kann gelöscht werden",
+                                    community_code=code, idempotency_key=reg_key),
+              [_err(201)], extra=lambda x: None if (x.body or {}).get("id") == first_id
+              else f"EG {(x.body or {}).get('id')} statt {first_id}")
+        c.run("REG-06", "Gleiche E-Mail erneut → 409 EMAIL_ALREADY_REGISTERED",
+              lambda: anon.register(email, "Doppelt", community_code=code + "-e"), [_err(409, "EMAIL_ALREADY_REGISTERED")])
         c.run("REG-07", "Gleiche E-Mail in Großbuchstaben → 409 EMAIL_ALREADY_REGISTERED",
-              lambda: anon.register(email.upper(), "Doppelt"), [_err(409, "EMAIL_ALREADY_REGISTERED")],
-              note_on={(201, None): "E-Mail-Vergleich ist case-sensitiv"})
+              lambda: anon.register(email.upper(), "Doppelt", community_code=code + "-f"),
+              [_err(409, "EMAIL_ALREADY_REGISTERED")], note_on={(201, None): "E-Mail-Vergleich ist case-sensitiv"})
+        c.run("REG-12", "Gleicher communityCode erneut → 409 COMMUNITY_CODE_ALREADY_REGISTERED",
+              lambda: anon.register("u-" + email, "Doppelt", community_code=code),
+              [_err(409, "COMMUNITY_CODE_ALREADY_REGISTERED")])
         c.run("REG-08", "Login einer PENDING-EG ohne Passwort-Vergabe → 401/403",
               lambda: anon.login(email, "egal-12345678"),
               [_err(401, "INVALID_CREDENTIALS"), _err(403, "ENERGY_COMMUNITY_NOT_ACTIVE")])
         sim.findings.info("check", f"Registrierungstest hat die PENDING-EG {email} angelegt – Admin kann sie löschen")
     return c.results
+
+
+def _rate_limit_check(c: Checker, sim: "Simulator") -> None:
+    """Vertrag 0.3 (W4, K4): Nach wiederholten Fehl-Logins sperrt die Plattform vorübergehend (429 mit Retry-After).
+    Die Grenze legt jede Plattform selbst fest. Geprüft wird mit einer unbekannten E-Mail, damit keine echte EG
+    gesperrt wird. Kommt bis zum 30. Versuch kein 429, ist das nur eine Warnung."""
+    anon = sim.base
+    email = f"egsim-ratelimit-{uuid.uuid4().hex[:8]}@egsim.example"
+    last = None
+    for _ in range(30):
+        last = anon.login(email, "falsch-123456")
+        if last.status == 429 or last.status not in (400, 401):
+            break
+    if last is None or last.status != 429:
+        sim.findings.warning("check", "RATE-01: 30 Fehl-Logins ohne 429 RATE_LIMITED – Missbrauchsschutz fehlt oder "
+                                      "die Grenze liegt höher", last.short() if last else None)
+        c.skip("RATE-01", "Sperre nach Fehl-Logins → 429", "keine Sperre innerhalb von 30 Versuchen")
+        return
+    c.run("RATE-01", "Gesperrte Anmeldung → 429 RATE_LIMITED mit Retry-After, auch vor 401",
+          lambda: anon.login(email, "falsch-123456"), [_err(429, "RATE_LIMITED")],
+          extra=lambda r: None if r.headers.get("retry-after") else "Header Retry-After fehlt")
 
 
 # =====================================================================================================================
@@ -628,7 +753,8 @@ def run_admin_checks(sim: "Simulator") -> list[dict]:
           [_err(404, "MARKET_NOT_FOUND")])
     c.run("ADM-03", "Tagesergebnis ohne Markt → 404 MARKET_NOT_FOUND", lambda: adm.market_result("2099-12-31"),
           [_err(404, "MARKET_NOT_FOUND")])
-    r = c.run("ADM-04", "Wegwerf-EG registrieren → 201 PENDING", lambda: anon.register(email, f"EGSim Admin-Test {rnd}"),
+    r = c.run("ADM-04", "Wegwerf-EG registrieren → 201 PENDING",
+              lambda: anon.register(email, f"EGSim Admin-Test {rnd}", community_code=f"egsim-admin-{rnd}"),
               [_err(201)], extra=lambda r: None if (r.body or {}).get("status") == "PENDING"
               else f"Status {(r.body or {}).get('status')}")
     if not r or r.status != 201:
@@ -636,6 +762,8 @@ def run_admin_checks(sim: "Simulator") -> list[dict]:
         return c.results
     ec_id = r.body["id"]
     c.run("ADM-05", "Gleichen Status erneut setzen → 200", lambda: adm.set_status(ec_id, "PENDING"), [_err(200)])
+    c.run("ADM-05b", "communityCode im Profil ändern → 400 VALIDATION_FAILED",
+          lambda: adm.update_community(ec_id, {"communityCode": f"egsim-neu-{rnd}"}), [_err(400, "VALIDATION_FAILED")])
     c.run("ADM-06", "Ungültiger Status → 400 VALIDATION_FAILED", lambda: adm.set_status(ec_id, "DELETED"),
           [_err(400, "VALIDATION_FAILED")])
     cred = c.run("ADM-07", "Zugangsdaten für PENDING-EG → 201", lambda: adm.issue_credentials(ec_id), [_err(201)])

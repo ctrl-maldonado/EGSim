@@ -225,9 +225,11 @@ class FalscherRest(MockPlatform):
                 hi[0]["allocatedKwh"], lo[-1]["allocatedKwh"] = lo[-1]["allocatedKwh"], hi[0]["allocatedKwh"]
 
 
-def test_szenario_erkennt_falschen_rundungsrest():
+@pytest.mark.parametrize("strict", [False, True])
+def test_szenario_erkennt_falschen_rundungsrest(strict):
+    # Der Rundungsrest gehört zum Referenzbeispiel Gruppe 1 (0.3.1): ohne strictReference nur Warnung, sonst Fehler
     p = FalscherRest()
-    srv, raw, d = _admin_setup(p, scenarios=["SZ-04", "SZ-01"])
+    srv, raw, d = _admin_setup(p, scenarios=["SZ-04", "SZ-01"], strictReference=strict)
     raw["communities"] = []
     try:
         rep = Simulator(parse_config(raw)).run_scenarios()
@@ -235,8 +237,10 @@ def test_szenario_erkennt_falschen_rundungsrest():
         srv.shutdown()
     res = {s["id"]: s for s in rep["scenarios"]}
     assert res["SZ-01"]["result"] == "PASS"
-    assert res["SZ-04"]["result"] == "FAIL"
+    assert res["SZ-04"]["result"] == ("FAIL" if strict else "PASS")
     assert any("3.334" in m for m in res["SZ-04"]["messages"])
+    if not strict:
+        assert any(f["area"] == "reference" and f["severity"] == "warning" for f in rep["findings"])
 
 
 def test_ui_passwortschutz(tmp_path):

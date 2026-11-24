@@ -17,7 +17,7 @@ from typing import Any
 
 from egsim import CONTRACT_VERSION, __version__
 from egsim.client import ApiClient, ApiResponse, RequestStats
-from egsim.config import CommunityConfig, Config
+from egsim.config import CommunityConfig, Config, slug_code
 from egsim.findings import Findings
 from egsim.profiles import KWH, PlannedPosition, plan_positions, select_intervals
 from egsim.settlement import D
@@ -57,6 +57,8 @@ class SubmittedPosition:
     created_at: str | None = None
     updated: bool = False
     cancelled: bool = False
+    idempotency_key: str | None = None   # Key der erfolgreichen Einreichung (für Wiederholungs-Checks)
+    submitted_body: dict | None = None   # genau dieser Body wurde mit dem Key gesendet
 
 
 @dataclass
@@ -201,19 +203,25 @@ class Simulator:
                 return False
             else:
                 c.email = c.email or (g.body or {}).get("email")
+                c.community_code = c.community_code or (g.body or {}).get("communityCode")
         if not c.energy_community_id:
-            email = c.email or f"egsim-{re.sub('[^a-z0-9]+', '-', eg.key.lower()).strip('-')}-{uuid.uuid4().hex[:6]}@egsim.example"
-            r = self.base.register(email, eg.key[:120], c.description or "Simulierte EG (EGSim)")
+            suffix = uuid.uuid4().hex[:6]
+            email = c.email or f"egsim-{re.sub('[^a-z0-9]+', '-', eg.key.lower()).strip('-')}-{suffix}@egsim.example"
+            code = c.community_code or slug_code(eg.key, suffix)
+            r = self.base.register(email, eg.key[:120], c.description or "Simulierte EG (EGSim)", community_code=code,
+                                   idempotency_key=str(uuid.uuid4()))
             if r.status == 201 and isinstance(r.body, dict) and r.body.get("id"):
-                c.energy_community_id, c.email = r.body["id"], email
-            elif r.status == 409 and r.code == "EMAIL_ALREADY_REGISTERED":
+                c.energy_community_id, c.email, c.community_code = r.body["id"], email, code
+            elif r.status == 409 and r.code in ("EMAIL_ALREADY_REGISTERED", "COMMUNITY_CODE_ALREADY_REGISTERED"):
+                key_field, value = ("email", email) if r.code == "EMAIL_ALREADY_REGISTERED" else ("communityCode", code)
                 lst = adm.list_communities()
                 match = next((x for x in (lst.body or []) if isinstance(x, dict)
-                              and str(x.get("email", "")).lower() == email.lower()), None) if lst.status == 200 else None
+                              and str(x.get(key_field, "")).lower() == value.lower()), None) if lst.status == 200 else None
                 if not match:
-                    self.findings.error("setup", f"[{eg.key}] E-Mail {email} ist vergeben, EG aber nicht auffindbar", r.short())
+                    self.findings.error("setup", f"[{eg.key}] {key_field} {value} ist vergeben, EG aber nicht auffindbar", r.short())
                     return False
-                c.energy_community_id, c.email = match["id"], email
+                c.energy_community_id, c.email = match["id"], match.get("email") or email
+                c.community_code = match.get("communityCode") or code
             else:
                 self.findings.error("setup", f"[{eg.key}] automatische Registrierung fehlgeschlagen", r.short())
                 return False
@@ -354,14 +362,15 @@ class Simulator:
             problems.append(f"resolution={m.get('resolution')}")
         if m.get("status") not in ("OPEN", "CLOSED", "SETTLED", "FAILED"):
             problems.append(f"status={m.get('status')}")
-        if not isinstance(m.get("prices"), dict):
-            problems.append("prices fehlt")
-        else:
-            # Vertrag 0.2 (korrigiert 19.11.): ab Marktöffnung sind alle drei Preise gesetzt, nie null
-            for f in ("buyPriceEurPerKwh", "sellPriceEurPerKwh", "reservePriceEurPerKwh"):
-                v = m["prices"].get(f)
-                if v is None or isinstance(v, bool) or not isinstance(v, (int, float, Decimal)):
-                    problems.append(f"prices.{f}={v!r} (Pflicht, Zahl)")
+        if m.get("prices") is not None:
+            # Vertrag 0.3: prices ist eine optionale Preisindikation; wenn vorhanden, alle drei Preise als Zahl
+            if not isinstance(m["prices"], dict):
+                problems.append("prices ist kein Objekt")
+            else:
+                for f in ("buyPriceEurPerKwh", "sellPriceEurPerKwh", "reservePriceEurPerKwh"):
+                    v = m["prices"].get(f)
+                    if v is None or isinstance(v, bool) or not isinstance(v, (int, float, Decimal)):
+                        problems.append(f"prices.{f}={v!r} (Zahl, wenn prices angegeben ist)")
         if not m.get("closesAt"):
             problems.append("closesAt fehlt")
         if problems:
@@ -379,7 +388,7 @@ class Simulator:
             run.final_status = (cur.body or {}).get("status") if cur.status == 200 else run.final_status
 
     def _check_close_status(self, r: ApiResponse) -> str | None:
-        """Vertrag 0.2 (korrigiert 19.11.): jede close-Antwort, auch eine Wiederholung, ist 200 bei SETTLED
+        """Vertrag 0.2 (korrigiert 19.11.) und 0.3.1: jede close-Antwort, auch eine Wiederholung, ist 200 bei SETTLED
         und 202 bei CLOSED."""
         status = (r.body or {}).get("status") if isinstance(r.body, dict) else None
         if r.status == 200 and status != "SETTLED":
@@ -476,7 +485,10 @@ class Simulator:
 
     def _submit(self, run: MarketRun, sp: SubmittedPosition) -> None:
         self._sleep(self._rng("delay", sp.eg.key, sp.planned.interval_start))
-        r = sp.eg.client.submit_position(sp.planned.body(run.delivery_date))
+        key, body = str(uuid.uuid4()), sp.planned.body(run.delivery_date)
+        r = sp.eg.client.submit_position(body, idempotency_key=key)
+        if r.status == 201:
+            sp.idempotency_key, sp.submitted_body = key, body
         if r.status == 409 and r.code == "POSITION_ALREADY_EXISTS":
             self._handle_existing(run, sp, r)
             return
@@ -718,10 +730,12 @@ class Simulator:
 
 
 def register_community(base_url: str, name: str, email: str, description: str | None, *,
-                       timeout: float = 10, verify_tls: bool = True, stats: RequestStats | None = None) -> ApiResponse:
+                       community_code: str | None = None, timeout: float = 10, verify_tls: bool = True,
+                       stats: RequestStats | None = None) -> ApiResponse:
     """Selbstregistrierung (POST /energy-communities, ohne Anmeldung). Danach Status PENDING."""
     client = ApiClient(base_url, stats=stats or RequestStats(), timeout=timeout, verify_tls=verify_tls, label=name)
-    return client.register(email, name, description)
+    return client.register(email, name, description, community_code=community_code or slug_code(name),
+                           idempotency_key=str(uuid.uuid4()))
 
 
 def eg_client(cfg: Config, community: CommunityConfig, stats: RequestStats) -> tuple[ApiClient | None, ApiResponse | None]:

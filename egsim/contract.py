@@ -28,30 +28,12 @@ SECRET_KEYS = {"password", "passwordhash", "apikey", "apikeyhash", "secret", "ha
 MAX_ISSUES_PER_RESPONSE = 5
 
 
-# Bekannte Fehler im Vertrag 0.2, die der Prüfer ausgleicht (sonst gäbe es Fehlalarme bei korrekten Plattformen):
-# Die Summenfelder von MarketResult, IntervalResult und Reserve nutzen QuantityKwhNonNegative mit maximum 1.000.000.
-# Das ist die Grenze für EINE Position. Tagessummen dürfen sie überschreiten (SZ-09 reicht allein 1.000.000 kWh ein).
-KNOWN_CONTRACT_ISSUES = [
-    "MarketResult/IntervalResult/Reserve: Summenfelder (totalOfferedKwh, tradableOfferedKwh, totalDemandKwh, "
-    "totalPurchasedKwh, totalSoldKwh, requiredKwh, dispatchedKwh) sind auf 1.000.000 kWh begrenzt. "
-    "Das ist die Grenze einer einzelnen Position. Vorschlag: eigenes Schema ohne maximum.",
-]
-_TOTAL_FIELDS = {
-    "MarketResult": ("totalOfferedKwh", "tradableOfferedKwh", "totalDemandKwh", "totalPurchasedKwh", "totalSoldKwh"),
-    "IntervalResult": ("totalOfferedKwh", "tradableOfferedKwh", "totalDemandKwh", "totalPurchasedKwh", "totalSoldKwh"),
-    "Reserve": ("requiredKwh", "dispatchedKwh"),
-}
+# Bekannte Fehler im Vertrag, die der Prüfer ausgleicht. In 0.3.1 ist keiner offen: Der Fehler aus 0.2
+# (Summenfelder mit maximum 1.000.000) ist mit dem Schema QuantityKwhTotal behoben.
+KNOWN_CONTRACT_ISSUES: list[str] = []
 
 
 def _patch(c: dict) -> dict:
-    schemas = c["schemas"]
-    base = schemas["QuantityKwhNonNegative"]
-    schemas["TotalKwhNonNegative"] = {k: v for k, v in base.items() if k != "maximum"}
-    for name, fields in _TOTAL_FIELDS.items():
-        for f in fields:
-            prop = schemas[name]["properties"][f]
-            if prop.get("$ref") == "#/components/schemas/QuantityKwhNonNegative":
-                prop["$ref"] = "#/components/schemas/TotalKwhNonNegative"
     return c
 
 
@@ -240,6 +222,28 @@ def _secrets(node: Any, path: str = "") -> list[str]:
     return found
 
 
+def check_headers(status: int, headers: dict[str, str] | None, body: Any, sent_request_id: str | None = None
+                  ) -> list[tuple[str, str]]:
+    """Header-Regeln aus 0.3.1: X-Request-Id in jeder Antwort (gleich der gesendeten), requestId im Fehler gleich
+    dem Header, Api-Version in jeder Antwort (Vorschlag, daher Warnung), Retry-After bei 429."""
+    if headers is None or status == 0:
+        return []
+    h = {k.lower(): v for k, v in headers.items()}
+    issues: list[tuple[str, str]] = []
+    rid = h.get("x-request-id")
+    if not rid:
+        issues.append(("error", "Header X-Request-Id fehlt (Pflicht in jeder Antwort)"))
+    elif sent_request_id and rid != sent_request_id:
+        issues.append(("error", f"X-Request-Id {rid!r} weicht von der gesendeten {sent_request_id!r} ab"))
+    if status >= 400 and isinstance(body, dict) and rid and "requestId" in body and body["requestId"] != rid:
+        issues.append(("error", f"requestId {body['requestId']!r} im Fehler ≠ Header X-Request-Id {rid!r}"))
+    if not h.get("api-version"):
+        issues.append(("warning", "Header Api-Version fehlt (Vorschlag in 0.3.1)"))
+    if status == 429 and not h.get("retry-after"):
+        issues.append(("error", "429 ohne Header Retry-After"))
+    return issues
+
+
 def check_response(method: str, template: str, status: int, body: Any, content_type: str | None = None
                    ) -> list[tuple[str, str]]:
     """Prüft eine Antwort gegen den Vertrag. Ergebnis: Liste (Schwere, Meldung); leer = konform.
@@ -254,7 +258,7 @@ def check_response(method: str, template: str, status: int, body: Any, content_t
     documented = str(status) in responses
     schema = responses.get(str(status))
     if not documented:
-        if status not in (401, 403, 500):  # diese Codes gelten laut Vertrag für alle Endpoints
+        if status not in (401, 403, 429, 500):  # diese Codes gelten laut Vertrag für alle Endpoints
             issues.append(("warning", f"Statuscode {status} ist für diesen Endpoint im Vertrag nicht vorgesehen"))
         schema = {"$ref": "#/components/schemas/Error"} if status >= 400 else None
     has_body = body not in (None, "")

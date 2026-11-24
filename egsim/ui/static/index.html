@@ -152,6 +152,7 @@
         <label class="f"><span>Registrierungstests</span><div><input type="checkbox" data-path="run.registrationChecks" data-type="bool"> <small>legt eine PENDING-Test-EG auf der Plattform an</small></div></label>
         <label class="f"><span>Ergebnisse prüfen</span><input type="checkbox" data-path="run.verifyResults" data-type="bool"></label>
         <label class="f"><span>Nur simulierte EGs am Markt</span><div><input type="checkbox" data-path="run.allParticipantsSimulated" data-type="bool"> <small>dann rechnet EGSim das Matching komplett nach</small></div></label>
+        <label class="f"><span>Referenzbeispiel Gruppe 1 streng</span><div><input type="checkbox" data-path="run.strictReference" data-type="bool"> <small>Abweichungen von festen Preisen und pro rata als Fehler statt Warnung (verbindlich sind nur die Invarianten)</small></div></label>
         <label class="f"><span>Toleranz</span><div class="row"><input type="number" min="0" step="0.001" data-path="run.tolerance.kwh" data-type="num"><span class="muted">kWh</span><input type="number" min="0" step="0.01" data-path="run.tolerance.eur" data-type="num"><span class="muted">EUR</span></div></label>
       </div>
     </div>
@@ -431,6 +432,7 @@ function renderEgs() {
         <div>
           <h3>Zugang</h3>
           <label class="f"><span>E-Mail</span><input type="email" data-eg="${c.uid}" data-f="email" value="${esc(c.email)}" placeholder="kontakt@eg.example"></label>
+          <label class="f"><span>communityCode</span><input class="mono" data-eg="${c.uid}" data-f="communityCode" value="${esc(c.communityCode)}" placeholder="z. B. eg-sonnenfeld (leer: aus dem Namen)"></label>
           <label class="f"><span>Beschreibung</span><input data-eg="${c.uid}" data-f="description" value="${esc(c.description)}"></label>
           <label class="f"><span>Anmeldung</span><select data-eg="${c.uid}" data-f="auth"><option value="apiKey" ${c.auth !== "bearer" ? "selected" : ""}>API-Key (X-API-Key)</option><option value="bearer" ${c.auth === "bearer" ? "selected" : ""}>E-Mail + Passwort (Bearer-Token)</option></select></label>
           <label class="f"><span>API-Key</span><input type="password" autocomplete="off" data-eg="${c.uid}" data-f="apiKey" value="${esc(c.apiKey)}" placeholder="vom Admin übergeben"></label>
@@ -492,7 +494,7 @@ function bindEgs() {
 async function egAction(act, uid, btn) {
   const out = $("#egres-" + uid);
   if (act === "del") { if (!confirm("EG aus der Konfiguration entfernen? Auf der Plattform bleibt sie bestehen.")) return; S.config.communities = S.config.communities.filter(c => c.uid !== uid); renderEgs(); return saveNow(); }
-  if (act === "dup") { const c = JSON.parse(JSON.stringify(eg(uid))); const n = await api("GET", "/api/config/default-community"); Object.assign(c, { uid: n.uid, name: c.name + " (Kopie)", apiKey: "", password: "", energyCommunityId: "", email: "", registeredStatus: undefined }); S.config.communities.push(c); renderEgs(); return saveNow(); }
+  if (act === "dup") { const c = JSON.parse(JSON.stringify(eg(uid))); const n = await api("GET", "/api/config/default-community"); Object.assign(c, { uid: n.uid, name: c.name + " (Kopie)", apiKey: "", password: "", energyCommunityId: "", email: "", communityCode: "", registeredStatus: undefined }); S.config.communities.push(c); renderEgs(); return saveNow(); }
   await saveNow();
   btn.disabled = true;
   try {

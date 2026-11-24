@@ -9,3 +9,4 @@ config.yaml
 *.state.json
 egsim-ui.json
 egsim-mock.json
+build/

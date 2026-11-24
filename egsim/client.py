@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -37,6 +38,12 @@ class ApiResponse:
     elapsed_ms: float
     error: str | None = None  # Transportfehler (Timeout, Verbindung)
     content_type: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)  # Antwort-Header, Namen kleingeschrieben
+    request_id: str | None = None                           # gesendete X-Request-Id
+
+    @property
+    def response_request_id(self) -> str | None:
+        return self.headers.get("x-request-id")
 
     @property
     def ok(self) -> bool:
@@ -183,6 +190,10 @@ class ApiClient:
                 h["Authorization"] = f"Bearer {self.token}"
         if headers:
             h.update(headers)
+        h = {k: v for k, v in h.items() if v is not None}  # None = Header bewusst weglassen
+        if "X-Request-Id" not in (headers or {}):
+            h["X-Request-Id"] = str(uuid.uuid4())
+        sent_rid = h.get("X-Request-Id")
         data = None
         if raw_body is not None:
             data = raw_body.encode()
@@ -203,7 +214,7 @@ class ApiClient:
             self.stats.record(method, template, 0, ms)
             self._detail(method, path, clean_params, json_body, raw_body, 0, None, ms, str(exc))
             log.warning("[%s] %s %s -> Transportfehler: %s", self.label, method, path, exc)
-            return ApiResponse(method, path, 0, None, ms, error=type(exc).__name__ + ": " + str(exc))
+            return ApiResponse(method, path, 0, None, ms, error=type(exc).__name__ + ": " + str(exc), request_id=sent_rid)
         ms = (time.perf_counter() - t0) * 1000
         body: Any = None
         if r.content:
@@ -216,9 +227,11 @@ class ApiClient:
         log.debug("[%s] %s %s -> %s (%.0f ms)", self.label, method, path, r.status_code, ms)
         if self.stats.validate_contract and not template.startswith("/_mock"):
             issues = contract.check_response(method, template, r.status_code, body, r.headers.get("Content-Type"))
+            issues += contract.check_headers(r.status_code, dict(r.headers), body, sent_rid)
             if issues:
                 self.stats.record_contract(method, template, r.status_code, issues, f"{method} {path} -> {r.status_code}")
-        return ApiResponse(method, path, r.status_code, body, ms, content_type=r.headers.get("Content-Type"))
+        return ApiResponse(method, path, r.status_code, body, ms, content_type=r.headers.get("Content-Type"),
+                           headers={k.lower(): v for k, v in r.headers.items()}, request_id=sent_rid)
 
     def _detail(self, method, path, params, json_body, raw_body, status, body, ms, error) -> None:
         req = _to_jsonable(json_body) if json_body is not None else raw_body
@@ -249,11 +262,15 @@ class ApiClient:
     def me(self) -> ApiResponse:
         return self.call("GET", "/me")
 
-    def register(self, email: str, name: str, description: str | None = None) -> ApiResponse:
+    def register(self, email: str, name: str, description: str | None = None, community_code: str | None = None,
+                 idempotency_key: str | None = None) -> ApiResponse:
         body = {"email": email, "name": name}
+        if community_code is not None:
+            body["communityCode"] = community_code
         if description:
             body["description"] = description
-        return self.call("POST", "/energy-communities", json_body=body, auth=False)
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return self.call("POST", "/energy-communities", json_body=body, auth=False, headers=headers)
 
     def list_communities(self, status: str | None = None) -> ApiResponse:
         return self.call("GET", "/energy-communities", params={"status": status})
@@ -273,8 +290,13 @@ class ApiClient:
     def issue_credentials(self, ec_id: str) -> ApiResponse:
         return self.call("POST", "/energy-communities/{id}/credentials", path_params={"id": ec_id})
 
-    def submit_position(self, body: dict) -> ApiResponse:
-        return self.call("POST", "/positions", json_body=body)
+    def submit_position(self, body: dict, idempotency_key: str | None = None) -> ApiResponse:
+        """Idempotency-Key ist ab 0.3 Pflicht. Ohne Angabe ein neuer Key je Aufruf; "" lässt den Header weg."""
+        key = str(uuid.uuid4()) if idempotency_key is None else idempotency_key
+        return self.call("POST", "/positions", json_body=body, headers={"Idempotency-Key": key or None})
+
+    def list_markets(self, status: str | None = None) -> ApiResponse:
+        return self.call("GET", "/markets", params={"status": status})
 
     def list_positions(self, **params: Any) -> ApiResponse:
         return self.call("GET", "/positions", params=params)

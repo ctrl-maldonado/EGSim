@@ -17,6 +17,19 @@ from typing import Any
 
 PROFILES = ("solar", "wind", "flat", "household", "business", "night")
 
+COMMUNITY_CODE = re.compile(r"^(?=.{3,40}$)[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+def slug_code(name: str, suffix: str = "") -> str:
+    """communityCode aus einem Namen ableiten, z. B. „EG Sonnenfeld“ → eg-sonnenfeld (mit Suffix eindeutig)."""
+    base = re.sub("[^a-z0-9]+", "-", name.lower().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
+                  .replace("ß", "ss")).strip("-") or "eg"
+    if suffix:
+        base = base[:40 - len(suffix) - 1].strip("-") + "-" + suffix
+    base = base[:40].strip("-")
+    return base if len(base) >= 3 else (base + "-eg")[:40]
+
+
 _ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
@@ -80,6 +93,7 @@ class CommunityConfig:
     enabled: bool = True
     description: str | None = None
     email: str | None = None
+    community_code: str | None = None  # plattformübergreifende Kennung (Vertrag 0.3); leer = aus dem Namen ableiten
     auth: str = "apiKey"  # apiKey | bearer
     api_key: str | None = None
     password: str | None = None
@@ -127,6 +141,9 @@ class Config:
     fail_on_findings: bool = True
     tolerance_kwh: Decimal = Decimal("0")
     tolerance_eur: Decimal = Decimal("0")
+    # Abweichungen vom nicht verbindlichen Referenzbeispiel Gruppe 1 (feste Preise, pro rata, Rundung) als Fehler
+    # statt als Warnung zählen. Für die Plattform der Gruppe 1 einschalten.
+    strict_reference: bool = False
 
     update_probability: float = 0.0
     update_change_percent: float = 20.0
@@ -153,7 +170,7 @@ def default_config_dict() -> dict:
             "submitPositions": True, "waitForSettlementMinutes": 0, "verifyResults": True,
             "allParticipantsSimulated": False, "checks": True, "validateSchema": True, "registrationChecks": False,
             "onExistingPosition": "skip", "reportDir": "reports", "failOnFindings": True,
-            "tolerance": {"kwh": 0, "eur": 0}, "autoProvision": True, "closeMarket": False, "parallelClose": 1, "adminChecks": True,
+            "tolerance": {"kwh": 0, "eur": 0}, "strictReference": False, "autoProvision": True, "closeMarket": False, "parallelClose": 1, "adminChecks": True,
             "scenarios": [], "scenarioDates": [],
         },
         "behaviour": {"updateProbability": 0.2, "updateChangePercent": 20, "cancelProbability": 0.05,
@@ -165,7 +182,7 @@ def default_config_dict() -> dict:
 
 def new_community_dict(name: str = "Neue EG", **extra) -> dict:
     d = {"uid": uuid.uuid4().hex[:12], "name": name, "enabled": True, "description": "Simulierte EG (EGSim)",
-         "email": "", "auth": "apiKey", "apiKey": "", "password": "", "energyCommunityId": "",
+         "email": "", "communityCode": "", "auth": "apiKey", "apiKey": "", "password": "", "energyCommunityId": "",
          "generation": None, "consumption": None, "priceExpectation": None}
     d.update(extra)
     return d
@@ -202,6 +219,9 @@ def _community(raw: dict, i: int) -> CommunityConfig:
             raise ConfigError(f"{where}: Nachkommastellen der Preisvorstellung 0 bis 5")
         if not 0 <= pe.probability <= 1:
             raise ConfigError(f"{where}: Wahrscheinlichkeit der Preisvorstellung 0 bis 1")
+    code = (raw.get("communityCode") or "").strip() or None
+    if code is not None and not COMMUNITY_CODE.match(code):
+        raise ConfigError(f"{where}: communityCode nur Kleinbuchstaben, Ziffern und einzelne Bindestriche, 3–40 Zeichen")
     auth = raw.get("auth") or "apiKey"
     if auth not in ("apiKey", "bearer"):
         raise ConfigError(f"{where}: Anmeldung apiKey oder bearer")
@@ -211,6 +231,7 @@ def _community(raw: dict, i: int) -> CommunityConfig:
         enabled=bool(raw.get("enabled", True)),
         description=raw.get("description") or None,
         email=raw.get("email") or None,
+        community_code=code,
         auth=auth,
         api_key=raw.get("apiKey") or None,
         password=raw.get("password") or None,
@@ -278,6 +299,7 @@ def parse_config(raw: dict) -> Config:
     tol = run.get("tolerance") or {}
     cfg.tolerance_kwh = Decimal(str(tol.get("kwh") or 0))
     cfg.tolerance_eur = Decimal(str(tol.get("eur") or 0))
+    cfg.strict_reference = bool(run.get("strictReference", cfg.strict_reference))
 
     beh = raw.get("behaviour") or {}
     cfg.update_probability = float(beh.get("updateProbability", cfg.update_probability))

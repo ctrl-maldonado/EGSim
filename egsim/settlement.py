@@ -1,6 +1,10 @@
-"""Referenzimplementierung der Handels- und Preislogik aus dem Datenvertrag 0.2 (Decimal, keine Floats).
+"""Referenzbeispiel Gruppe 1 der Handels- und Preislogik aus dem Datenvertrag 0.3.1 (Decimal, keine Floats).
 
-Wird vom Verifier genutzt, um die Ergebnisse der Plattform nachzurechnen, und vom Mock-Server.
+Verbindlich sind laut Vertrag nur die neun Invarianten (siehe verify.py). Diese Datei rechnet das nicht verbindliche
+Referenzbeispiel nach: feste Preise, pro rata bei Überangebot, Rundung auf 0,001 kWh, Rest nach createdAt.
+Die Preisvorstellung ist nur informativ und beeinflusst die Zuteilung nicht.
+
+Wird vom Verifier genutzt (Vergleich mit dem Referenzbeispiel) und vom Mock-Server.
 """
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ from egsim.timeutil import normalize_interval, parse_ts
 
 STEP = Decimal("0.001")
 CENT = Decimal("0.01")
+PRICE_STEP = Decimal("0.00001")
+RULE_VERSION = "gruppe1-prorata-1.0"
 ZERO = Decimal(0)
 
 
@@ -21,6 +27,13 @@ def floor_kwh(x: Decimal) -> Decimal:
 
 def round_eur(x: Decimal) -> Decimal:
     return x.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def avg_price(amount: Decimal, qty: Decimal) -> Decimal | None:
+    """Durchschnittspreis nach Menge: Summe Beträge / Summe Mengen, kaufmännisch auf 5 Nachkommastellen; None ohne Menge."""
+    if qty <= 0:
+        return None
+    return (amount / qty).quantize(PRICE_STEP, rounding=ROUND_HALF_UP)
 
 
 def D(x) -> Decimal | None:
@@ -94,7 +107,6 @@ class ReserveRef:
 class IntervalRef:
     interval_start: str | None
     total_offered: Decimal
-    tradable_offered: Decimal
     total_demand: Decimal
     total_purchased: Decimal
     total_sold: Decimal
@@ -107,7 +119,6 @@ class IntervalRef:
 class SettlementRef:
     intervals: list[IntervalRef]
     total_offered: Decimal
-    tradable_offered: Decimal
     total_demand: Decimal
     total_purchased: Decimal
     total_sold: Decimal
@@ -115,6 +126,9 @@ class SettlementRef:
     purchase_cost: Decimal
     sales_revenue: Decimal
     margin: Decimal
+    avg_buy: Decimal | None = None       # MarketResult.prices: Durchschnitt nach Menge, None ohne Geschäft
+    avg_sell: Decimal | None = None
+    avg_reserve: Decimal | None = None
 
     @property
     def allocations(self) -> list[Allocation]:
@@ -158,27 +172,20 @@ def settle_interval(positions: list[Pos], prices: Prices, dispatched: Decimal | 
     (Mock) oder None (= Reserve deckt vollständig)."""
     offers = [p for p in positions if p.type == "OFFER"]
     demands = [p for p in positions if p.type == "DEMAND"]
-
-    def tradable(p: Pos) -> bool:
-        if p.price_expectation is None:
-            return True
-        return prices.buy is not None and p.price_expectation <= prices.buy
-
-    trad = [p for p in offers if tradable(p)]
-    non_trad = [p for p in offers if not tradable(p)]
-    S = sum((p.quantity for p in trad), ZERO)
+    S = sum((p.quantity for p in offers), ZERO)   # alle Angebote, die Preisvorstellung ist nur informativ
     Dm = sum((p.quantity for p in demands), ZERO)
 
-    allocs: list[Allocation] = [Allocation(p, ZERO, "PRICE_NOT_MET") for p in non_trad]
+    allocs: list[Allocation] = []
     if Dm == 0:
-        allocs += [Allocation(p, ZERO, "NOT_NEEDED") for p in trad]
+        allocs += [Allocation(p, ZERO, "NOT_NEEDED") for p in offers]
         purchased = ZERO
     elif S <= Dm:
-        allocs += [Allocation(p, p.quantity, "FULLY_ALLOCATED") for p in trad]
+        allocs += [Allocation(p, p.quantity, "FULLY_ALLOCATED") for p in offers]
         purchased = S
     else:
-        shares = pro_rata(trad, Dm)
-        allocs += [Allocation(p, shares[p.id], "PARTIALLY_ALLOCATED") for p in trad]
+        shares = pro_rata(offers, Dm)
+        allocs += [Allocation(p, shares[p.id], "PARTIALLY_ALLOCATED" if shares[p.id] > 0 else "NOT_ALLOCATED")
+                   for p in offers]
         purchased = Dm
 
     required = max(Dm - S, ZERO)
@@ -219,8 +226,7 @@ def settle_interval(positions: list[Pos], prices: Prices, dispatched: Decimal | 
     res_cost = round_eur(disp * prices.reserve) if disp > 0 and prices.reserve is not None else ZERO
     return IntervalRef(
         interval_start=interval_start,
-        total_offered=sum((p.quantity for p in offers), ZERO),
-        tradable_offered=S,
+        total_offered=S,
         total_demand=Dm,
         total_purchased=sum((t.quantity for t in trades if t.direction == "PLATFORM_BUYS"), ZERO),
         total_sold=sum(dem_alloc.values(), ZERO),
@@ -264,7 +270,6 @@ def settle(positions: Iterable[Pos], prices: Prices, resolution: str,
     return SettlementRef(
         intervals=intervals,
         total_offered=sum((i.total_offered for i in intervals), ZERO),
-        tradable_offered=sum((i.tradable_offered for i in intervals), ZERO),
         total_demand=sum((i.total_demand for i in intervals), ZERO),
         total_purchased=sum((i.total_purchased for i in intervals), ZERO),
         total_sold=sum((i.total_sold for i in intervals), ZERO),
@@ -272,4 +277,7 @@ def settle(positions: Iterable[Pos], prices: Prices, resolution: str,
         purchase_cost=purchase,
         sales_revenue=sales,
         margin=sales - purchase - reserve.cost,
+        avg_buy=avg_price(purchase, sum((t.quantity for t in trades if t.direction == "PLATFORM_BUYS"), ZERO)),
+        avg_sell=avg_price(sales, sum((t.quantity for t in trades if t.direction == "PLATFORM_SELLS"), ZERO)),
+        avg_reserve=avg_price(reserve.cost, reserve.dispatched),
     )

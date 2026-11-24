@@ -18,7 +18,7 @@ POSITION = {
     "priceExpectationEurPerKwh": Decimal("0.09"), "status": "OPEN", "rejectionReason": None,
     "createdAt": "2026-11-18T09:00:00Z", "updatedAt": "2026-11-18T09:00:00Z",
 }
-ERROR = {"code": "FORBIDDEN", "message": "nope"}
+ERROR = {"code": "FORBIDDEN", "message": "nope", "requestId": "r-1"}
 
 
 def check(status, body, method="GET", template="/positions/{id}", ctype="application/json"):
@@ -71,12 +71,23 @@ def test_pflichtfeld_fehlt():
 
 
 def test_fehlerformat():
-    assert "kein erlaubter Wert" in messages(check(403, {"code": "NOPE", "message": "x"}))
-    assert "/message: Pflichtfeld fehlt" in messages(check(403, {"code": "FORBIDDEN"}))
+    assert "kein erlaubter Wert" in messages(check(403, {"code": "NOPE", "message": "x", "requestId": "r"}))
+    assert "/message: Pflichtfeld fehlt" in messages(check(403, {"code": "FORBIDDEN", "requestId": "r"}))
+    assert "/requestId: Pflichtfeld fehlt" in messages(check(403, {"code": "FORBIDDEN", "message": "x"}))
     assert "/details/0/field: Pflichtfeld fehlt" in messages(
-        check(400, {"code": "VALIDATION_FAILED", "message": "x", "details": [{"message": "m"}]}))
-    assert check(400, {"code": "VALIDATION_FAILED", "message": "x",
+        check(400, {"code": "VALIDATION_FAILED", "message": "x", "requestId": "r", "details": [{"message": "m"}]}))
+    assert check(400, {"code": "VALIDATION_FAILED", "message": "x", "requestId": "r",
                        "details": [{"field": "/quantityKwh", "code": "INVALID_QUANTITY", "message": "m"}]}) == []
+
+
+def test_header_regeln_0_3():
+    ok = {"X-Request-Id": "abc", "Api-Version": "0.3.1"}
+    assert contract.check_headers(200, ok, POSITION, "abc") == []
+    assert "fehlt" in messages(contract.check_headers(200, {"Api-Version": "0.3.1"}, POSITION))
+    assert "weicht" in messages(contract.check_headers(200, {**ok, "X-Request-Id": "xyz"}, POSITION, "abc"))
+    assert "requestId" in messages(contract.check_headers(403, ok, {**ERROR, "requestId": "andere"}, "abc"))
+    assert [s for s, _ in contract.check_headers(200, {"X-Request-Id": "abc"}, POSITION, "abc")] == ["warning"]
+    assert "Retry-After" in messages(contract.check_headers(429, ok, {**ERROR, "requestId": "abc"}, "abc"))
 
 
 def test_body_status_und_content_type():
@@ -87,7 +98,7 @@ def test_body_status_und_content_type():
     # nicht dokumentierter Status: nur Warnung, Fehlerformat wird trotzdem geprüft
     iss = check(418, ERROR)
     assert [s for s, _ in iss] == ["warning"]
-    assert check(500, {"code": "INTERNAL_ERROR", "message": "x"}) == []   # 401/403/500 gelten überall
+    assert check(500, {"code": "INTERNAL_ERROR", "message": "x", "requestId": "r"}) == []  # 401/403/429/500 überall
 
 
 def test_zugangsdaten_nur_in_den_vorgesehenen_antworten():
@@ -112,7 +123,7 @@ def test_anfrage_schemas_if_then_und_unbekannte_felder():
 
 
 def test_vertragsversion():
-    assert contract.version().startswith("0.2")
+    assert contract.version() == "0.3.1"
 
 
 # ---------------------------------------------------------------------------------------------------------------------

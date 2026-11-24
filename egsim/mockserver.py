@@ -1,4 +1,8 @@
-"""In-Memory-Mock der Handelsplattform (Datenvertrag 0.2) – nur zum Testen des Simulators.
+"""In-Memory-Mock der Handelsplattform (Datenvertrag 0.3.1) – nur zum Testen des Simulators.
+
+Setzt das Referenzbeispiel Gruppe 1 um (feste Preise, pro rata) und die Regeln aus 0.3.1: communityCode,
+Idempotency-Key, X-Request-Id und requestId, Api-Version, GET /markets, 429 bei wiederholten Fehl-Logins,
+Durchschnittspreise im Tagesergebnis.
 
 Achtung: Der Mock rechnet mit derselben Referenzlogik wie der Verifier. Gegen den Mock bestätigt die Ergebnisprüfung
 also nur, dass der Simulator-Ablauf funktioniert, nicht die Richtigkeit der Logik. Dafür gibt es die Unit-Tests
@@ -23,12 +27,16 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from egsim.client import _to_jsonable
-from egsim.settlement import Pos, Prices, settle
+from egsim.settlement import RULE_VERSION, Pos, Prices, settle
 from egsim.timeutil import (day_bounds_utc, format_utc, is_interval_format, is_iso_date, normalize_interval, now_utc,
-                            parse_ts, resolve_delivery_date, today_vienna)
+                            parse_ts, resolve_delivery_date)
 
 log = logging.getLogger("egsim.mock")
 
+API_VERSION = "0.3.1"
+RETRY_AFTER_SECONDS = 60
+LOGIN_MAX_FAILURES = 5
+CODE_RE = re.compile(r"^(?=.{3,40}$)[a-z0-9]+(-[a-z0-9]+)*$")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 TRANSITIONS = {("PENDING", "ACTIVE"), ("PENDING", "SUSPENDED"), ("ACTIVE", "SUSPENDED"), ("SUSPENDED", "ACTIVE")}
@@ -49,22 +57,25 @@ MESSAGES = {
     "POSITION_NOT_FOUND": "The position does not exist.",
     "MARKET_NOT_FOUND": "No market exists for the delivery date.",
     "EMAIL_ALREADY_REGISTERED": "An energy community with this email is already registered.",
+    "COMMUNITY_CODE_ALREADY_REGISTERED": "This communityCode is already registered.",
+    "IDEMPOTENCY_KEY_REUSED": "The Idempotency-Key was already used with a different request body.",
+    "RATE_LIMITED": "Too many requests. Retry after the time given in Retry-After.",
     "ENERGY_COMMUNITY_IN_USE": "The energy community cannot be deleted because it has positions or trades.",
     "INVALID_STATUS_TRANSITION": "This status change is not allowed.",
     "POSITION_ALREADY_EXISTS": "A position already exists for this energy community, delivery date and interval.",
     "POSITION_NOT_MODIFIABLE": "The position is cancelled or already processed and can no longer be changed.",
     "MARKET_CLOSED": "The market is already closed.",
     "MARKET_NOT_SETTLED": "The market result is not available yet.",
-    "DELIVERY_DATE_IN_PAST": "The delivery date is in the past.",
     "INTERNAL_ERROR": "Internal error.",
 }
 STATUS_OF = {"VALIDATION_FAILED": 400, "INVALID_ID": 400, "INVALID_DELIVERY_DATE": 400, "INVALID_INTERVAL": 400,
              "INVALID_POSITION_TYPE": 400, "INVALID_QUANTITY": 400, "INVALID_PRICE": 400, "UNAUTHORIZED": 401,
              "INVALID_CREDENTIALS": 401, "FORBIDDEN": 403, "ENERGY_COMMUNITY_NOT_ACTIVE": 403,
              "ENERGY_COMMUNITY_NOT_FOUND": 404, "POSITION_NOT_FOUND": 404, "MARKET_NOT_FOUND": 404,
-             "EMAIL_ALREADY_REGISTERED": 409, "ENERGY_COMMUNITY_IN_USE": 409, "INVALID_STATUS_TRANSITION": 409,
+             "EMAIL_ALREADY_REGISTERED": 409, "COMMUNITY_CODE_ALREADY_REGISTERED": 409,
+             "IDEMPOTENCY_KEY_REUSED": 409, "RATE_LIMITED": 429, "ENERGY_COMMUNITY_IN_USE": 409, "INVALID_STATUS_TRANSITION": 409,
              "POSITION_ALREADY_EXISTS": 409, "POSITION_NOT_MODIFIABLE": 409, "MARKET_CLOSED": 409,
-             "MARKET_NOT_SETTLED": 409, "DELIVERY_DATE_IN_PAST": 422, "INTERNAL_ERROR": 500}
+             "MARKET_NOT_SETTLED": 409, "INTERNAL_ERROR": 500}
 
 
 DEMO_NAMES = ["EG Sonnenfeld", "EG Windpark Nord", "EG Altstadt", "Gewerbepark Süd", "EG Dorfmitte"]
@@ -144,6 +155,8 @@ class MockPlatform:
         self.positions: dict[str, dict] = {}
         self.markets: dict[str, dict] = {}
         self.results: dict[str, dict] = {}
+        self.idempotency: dict[tuple[str, str, str], tuple[Any, int, Any]] = {}  # (Identität, Endpoint, Key) -> Antwort
+        self.login_failures: dict[str, list[float]] = {}  # E-Mail -> Zeitpunkte der Fehlversuche
 
     # ------------------------------------------------------------------ setup
     def add_market(self, d: str, resolution: str = "DAY", buy: str = "0.10", sell: str = "0.14", reserve: str = "0.20",
@@ -213,7 +226,41 @@ class MockPlatform:
             raise ApiErr("VALIDATION_FAILED", details)
 
     def _ec_public(self, ec: dict) -> dict:
-        return {k: ec[k] for k in ("id", "email", "name", "description", "status", "createdAt", "updatedAt") if k in ec}
+        return {k: ec[k] for k in ("id", "communityCode", "email", "name", "description", "status", "createdAt",
+                                   "updatedAt") if k in ec}
+
+    # ------------------------------------------------------------- idempotency
+    @staticmethod
+    def _idem_key(h: dict, required: bool) -> str | None:
+        key = h.get("idempotency-key")
+        if key is None and not required:
+            return None
+        if not isinstance(key, str) or not UUID_RE.match(key):
+            raise ApiErr("VALIDATION_FAILED", [{"field": "header:Idempotency-Key", "code": "VALIDATION_FAILED",
+                                                "message": "Idempotency-Key is required and must be a UUID."}])
+        return key.lower()
+
+    def _idempotent(self, scope: tuple[str, str, str] | None, raw: bytes, fn) -> tuple[int, Any]:
+        """Gleicher Key + gleicher Inhalt (nach JSON-Parsen) = gespeicherte Antwort, anderer Inhalt = 409."""
+        if scope is None:
+            return fn()
+        try:
+            content: Any = json.loads(raw, parse_float=Decimal) if raw else None
+        except ValueError:
+            content = raw
+        if scope in self.idempotency:
+            stored_content, status, body = self.idempotency[scope]
+            if stored_content != content:
+                raise ApiErr("IDEMPOTENCY_KEY_REUSED")
+            return status, body
+        try:
+            status, body = fn()
+        except ApiErr as e:
+            if e.status in (400, 404, 409, 422):
+                self.idempotency[scope] = (content, e.status, e.body())
+            raise
+        self.idempotency[scope] = (content, status, body)
+        return status, body
 
     def _market(self, d: str) -> dict:
         m = self.markets.get(d)
@@ -249,6 +296,7 @@ class MockPlatform:
         ("GET", r"/positions/([^/]+)", "get_position"),
         ("PUT", r"/positions/([^/]+)", "put_position"),
         ("DELETE", r"/positions/([^/]+)", "cancel_position"),
+        ("GET", r"/markets", "list_markets"),
         ("GET", r"/markets/([^/]+)", "get_market"),
         ("POST", r"/markets/([^/]+)/close", "close"),
         ("GET", r"/markets/([^/]+)/result", "result"),
@@ -270,21 +318,44 @@ class MockPlatform:
             known_path = True
             if m != method:
                 continue
+            rid = headers.get("x-request-id") or ""
             try:
                 with self.lock:
-                    return getattr(self, "h_" + name)(*mt.groups(), q=query, h=headers, raw=raw)
+                    status, body = getattr(self, "h_" + name)(*mt.groups(), q=query, h=headers, raw=raw)
             except ApiErr as e:
-                return e.status, e.body()
+                status, body = e.status, e.body()
             except Exception:  # noqa: BLE001
                 log.exception("Fehler im Mock")
-                return 500, ApiErr("INTERNAL_ERROR").body()
-        return (405 if known_path else 404), {"code": "VALIDATION_FAILED", "message": f"No route for {method} {path}"}
+                status, body = 500, ApiErr("INTERNAL_ERROR").body()
+            if status >= 400 and isinstance(body, dict):
+                body = {**body, "requestId": rid}  # gespeicherte Antworten tragen die aktuelle Request-ID
+            return status, body
+        return (405 if known_path else 404), {"code": "VALIDATION_FAILED", "message": f"No route for {method} {path}",
+                                              "requestId": headers.get("x-request-id") or ""}
 
     # -------------------------------------------------------------- endpoints
     def h_health(self, _kind, **_):
         return 200, {"status": "UP", "checks": {"database": "UP"}}
 
+    def _locked(self, email: Any) -> bool:
+        if not isinstance(email, str):
+            return False
+        now = time.time()
+        recent = [t for t in self.login_failures.get(email.lower(), []) if now - t < RETRY_AFTER_SECONDS]
+        self.login_failures[email.lower()] = recent
+        return len(recent) >= LOGIN_MAX_FAILURES
+
+    def _login_failed(self, email: str) -> ApiErr:
+        self.login_failures.setdefault(email.lower(), []).append(time.time())
+        return ApiErr("INVALID_CREDENTIALS")
+
     def h_login(self, q, h, raw):
+        try:  # 429 zuerst (0.3.1, K4): eine gesperrte Anmeldung erhält 429, auch mit falschem Passwort
+            peek = json.loads(raw) if raw else None
+        except ValueError:
+            peek = None
+        if isinstance(peek, dict) and self._locked(peek.get("email")):
+            raise ApiErr("RATE_LIMITED")
         b = self._body(raw)
         self._fields(b, {"email", "password"}, {"email", "password"})
         if not isinstance(b["email"], str) or not isinstance(b["password"], str) or len(b["password"]) > 128 \
@@ -297,9 +368,10 @@ class MockPlatform:
             return 200, {"token": tok, "tokenType": "Bearer", "expiresIn": 3600, "role": "ADMIN"}
         ec = next((e for e in self.ecs.values() if e["email"].lower() == email), None)
         if not ec or self.secrets.get(ec["id"], {}).get("password") != _hash(b["password"]):
-            raise ApiErr("INVALID_CREDENTIALS")
+            raise self._login_failed(email)
         if ec["status"] != "ACTIVE":
             raise ApiErr("ENERGY_COMMUNITY_NOT_ACTIVE")
+        self.login_failures.pop(email, None)
         tok = secrets.token_urlsafe(24)
         self.tokens[tok] = ("ENERGY_COMMUNITY", ec["id"], time.time() + 3600)
         return 200, {"token": tok, "tokenType": "Bearer", "expiresIn": 3600, "role": "ENERGY_COMMUNITY",
@@ -327,19 +399,28 @@ class MockPlatform:
                 details.append(_detail("description", "VALIDATION_FAILED", "1-500 characters"))
 
     def h_register(self, q, h, raw):
+        key = self._idem_key(h, required=False)
+        return self._idempotent(("PUBLIC", "register", key) if key else None, raw, lambda: self._register(raw))
+
+    def _register(self, raw):
         b = self._body(raw)
-        self._fields(b, {"email", "name", "description"}, {"email", "name"})
+        self._fields(b, {"email", "name", "description", "communityCode"}, {"email", "name", "communityCode"})
         details: list = []
         if not isinstance(b["email"], str) or len(b["email"]) > 254 or not EMAIL_RE.match(b["email"]):
             details.append(_detail("email", "VALIDATION_FAILED", "invalid email"))
+        if not isinstance(b["communityCode"], str) or not CODE_RE.match(b["communityCode"]):
+            details.append(_detail("communityCode", "VALIDATION_FAILED",
+                                   "lowercase letters, digits and single hyphens, 3-40 characters"))
         self._validate_profile(b, details)
         if details:
             raise ApiErr("VALIDATION_FAILED", details)
         if any(e["email"].lower() == b["email"].lower() for e in self.ecs.values()):
             raise ApiErr("EMAIL_ALREADY_REGISTERED")
+        if any(e.get("communityCode") == b["communityCode"] for e in self.ecs.values()):
+            raise ApiErr("COMMUNITY_CODE_ALREADY_REGISTERED")
         ts = _ts()
-        ec = {"id": str(uuid.uuid4()), "email": b["email"], "name": b["name"], "status": "PENDING",
-              "createdAt": ts, "updatedAt": ts}
+        ec = {"id": str(uuid.uuid4()), "communityCode": b["communityCode"], "email": b["email"], "name": b["name"],
+              "status": "PENDING", "createdAt": ts, "updatedAt": ts}
         if "description" in b:
             ec["description"] = b["description"]
         self.ecs[ec["id"]] = ec
@@ -435,6 +516,10 @@ class MockPlatform:
     def h_submit(self, q, h, raw):
         role, ec, _ = self._auth(h)
         self._need(role, "ENERGY_COMMUNITY")
+        key = self._idem_key(h, required=True)
+        return self._idempotent((ec["id"], "positions", key), raw, lambda: self._submit(ec, raw))
+
+    def _submit(self, ec, raw):
         b = self._body(raw)
         allowed = {"energyCommunityId", "deliveryDate", "intervalStart", "type", "quantityKwh", "priceExpectationEurPerKwh"}
         self._fields(b, allowed, {"deliveryDate", "type", "quantityKwh"})
@@ -465,9 +550,7 @@ class MockPlatform:
         # 403 eigene Ressource
         if "energyCommunityId" in b and b["energyCommunityId"].lower() != ec["id"]:
             raise ApiErr("FORBIDDEN", message="energyCommunityId does not belong to the authenticated energy community.")
-        # 409 / 422
-        if date.fromisoformat(d) < today_vienna():
-            raise ApiErr("DELIVERY_DATE_IN_PAST")
+        # 409 (0.3: ein Liefertag in der Vergangenheit ist kein Ablehnungsgrund, nur der Markt zählt)
         if self._market_closed(m):
             raise ApiErr("MARKET_CLOSED")
         if any(p["energyCommunityId"] == ec["id"] and p["deliveryDate"] == d and p["intervalStart"] == interval
@@ -480,7 +563,7 @@ class MockPlatform:
         if price is not None:
             p["priceExpectationEurPerKwh"] = Decimal(price)
         self.positions[p["id"]] = p
-        return 201, p
+        return 201, dict(p)  # Kopie: die gespeicherte Idempotenz-Antwort bleibt wie beim ersten Mal
 
     def _filter_ec(self, role: str, ec: dict | None, q: dict) -> str | None:
         f = q.get("energyCommunityId")
@@ -565,6 +648,8 @@ class MockPlatform:
         role, ec, _ = self._auth(h)
         self._need(role, "ENERGY_COMMUNITY")
         p = self._load_position(role, ec, raw_id)
+        if p["status"] == "CANCELLED":
+            return 200, p  # 0.3: von sich aus idempotent, keine Änderung
         if p["status"] != "OPEN":
             raise ApiErr("POSITION_NOT_MODIFIABLE")
         if self._market_closed(self._market(p["deliveryDate"])):
@@ -574,6 +659,14 @@ class MockPlatform:
         return 200, p
 
     # ---------------------------------------------------------------- markets
+    def h_list_markets(self, q, h, raw):
+        self._auth(h)
+        st = q.get("status")
+        if st is not None and st not in ("OPEN", "CLOSED", "SETTLED", "FAILED"):
+            raise ApiErr("VALIDATION_FAILED", [_detail("status", "VALIDATION_FAILED", "invalid status")])
+        return 200, sorted((m for m in self.markets.values() if st is None or m["status"] == st),
+                           key=lambda m: m["deliveryDate"])
+
     def h_get_market(self, raw_d, q, h, raw):
         self._auth(h)
         return 200, self._market(self._check_date(raw_d))
@@ -610,8 +703,11 @@ class MockPlatform:
         """Aktive EG mit Zugangsdaten anlegen (übernimmt im Mock die Rolle des Admins)."""
         with self.lock:
             ts = _ts()
-            ec = {"id": str(uuid.uuid4()), "email": email or f"{re.sub('[^a-z0-9]+', '-', name.lower()).strip('-')}"
-                  f"@demo.egsim.example", "name": name, "description": "Demo-EG im Mock", "status": "ACTIVE",
+            slug = re.sub('[^a-z0-9]+', '-', name.lower()).strip('-') or "eg"
+            code = slug if not any(e.get("communityCode") == slug for e in self.ecs.values()) \
+                else f"{slug[:33]}-{uuid.uuid4().hex[:6]}"
+            ec = {"id": str(uuid.uuid4()), "communityCode": code, "email": email or f"{slug}@demo.egsim.example",
+                  "name": name, "description": "Demo-EG im Mock", "status": "ACTIVE",
                   "createdAt": ts, "updatedAt": ts}
             self.ecs[ec["id"]] = ec
             api_key, pw = "egk_" + secrets.token_urlsafe(24), secrets.token_urlsafe(12)
@@ -665,14 +761,17 @@ class MockPlatform:
         def reserve(r):
             return {"deliveryDate": d, "status": r.status, "requiredKwh": r.required, "dispatchedKwh": r.dispatched,
                     "priceEurPerKwh": r.price, "costEur": r.cost}
+        avg = {"deliveryDate": d, "buyPriceEurPerKwh": ref.avg_buy, "sellPriceEurPerKwh": ref.avg_sell,
+               "reservePriceEurPerKwh": ref.avg_reserve}
         result = {"deliveryDate": d, "resolution": m["resolution"], "status": "SETTLED", "settledAt": ts,
-                  "totalOfferedKwh": ref.total_offered, "tradableOfferedKwh": ref.tradable_offered,
+                  "ruleVersion": RULE_VERSION,
+                  "totalOfferedKwh": ref.total_offered,
                   "totalDemandKwh": ref.total_demand, "totalPurchasedKwh": ref.total_purchased,
-                  "totalSoldKwh": ref.total_sold, "reserve": reserve(ref.reserve), "prices": m["prices"],
+                  "totalSoldKwh": ref.total_sold, "reserve": reserve(ref.reserve), "prices": avg,
                   "purchaseCostEur": ref.purchase_cost, "salesRevenueEur": ref.sales_revenue, "marginEur": ref.margin}
         if m["resolution"] == "QUARTER_HOUR":
             result["intervals"] = [{"intervalStart": i.interval_start, "totalOfferedKwh": i.total_offered,
-                                    "tradableOfferedKwh": i.tradable_offered, "totalDemandKwh": i.total_demand,
+                                    "totalDemandKwh": i.total_demand,
                                     "totalPurchasedKwh": i.total_purchased, "totalSoldKwh": i.total_sold,
                                     "reserve": reserve(i.reserve)} for i in ref.intervals]
         for p in closed:
@@ -744,9 +843,17 @@ def make_handler(platform: MockPlatform):
             n = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(n) if n else b""
             headers = {k.lower(): v for k, v in self.headers.items()}
+            rid = headers.get("x-request-id")
+            if not rid or not (1 <= len(rid) <= 128):
+                rid = str(uuid.uuid4())
+            headers["x-request-id"] = rid
             status, body = platform.handle(self.command, u.path, q, headers, raw)
             data = b"" if body is None else json.dumps(_to_jsonable(body)).encode()
             self.send_response(status)
+            self.send_header("X-Request-Id", rid)
+            self.send_header("Api-Version", API_VERSION)
+            if status == 429:
+                self.send_header("Retry-After", str(RETRY_AFTER_SECONDS))
             if data:
                 self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))

@@ -136,7 +136,7 @@ class UiState:
     def sync_communities(self, cfg) -> None:
         """Vom Simulator angelegte oder geänderte Zugangsdaten (automatische Einrichtung) in die Datei übernehmen."""
         fields = {"email": "email", "api_key": "apiKey", "password": "password",
-                  "energy_community_id": "energyCommunityId"}
+                  "energy_community_id": "energyCommunityId", "community_code": "communityCode"}
         changed = False
         with self.lock:
             comms = self.raw.setdefault("communities", [])
@@ -393,11 +393,13 @@ def make_handler(state: UiState, password: str | None = None, user: str = "egsim
                 email = (raw.get("email") or "").strip()
                 if not email:
                     raise ValueError("Für die Registrierung eine E-Mail-Adresse eintragen")
+                code = (raw.get("communityCode") or "").strip() or None
                 r = register_community(cfg.base_url, raw.get("name", "").strip(), email, raw.get("description") or None,
-                                       timeout=cfg.timeout, verify_tls=cfg.verify_tls, stats=state.manual_stats)
+                                       community_code=code, timeout=cfg.timeout, verify_tls=cfg.verify_tls, stats=state.manual_stats)
                 if r.status == 201 and isinstance(r.body, dict) and r.body.get("id"):
                     with state.lock:
                         raw["energyCommunityId"] = r.body["id"]
+                        raw["communityCode"] = r.body.get("communityCode") or code or ""
                         raw["registeredStatus"] = r.body.get("status")
                         state.save()
                 self._send(200, {"status": r.status, "response": _to_jsonable(r.body), "error": r.error,
@@ -538,7 +540,8 @@ def mock_config(url: str, egs: list[dict]) -> dict:
     from egsim.scenarios import CATALOG
     cfg["run"]["scenarios"] = [sc.id for sc in CATALOG]
     cfg["communities"] = [new_community_dict(e["name"], email=e["email"], apiKey=e["apiKey"], password=e["password"],
-                                             energyCommunityId=e["id"], **flows[i % len(flows)])
+                                             energyCommunityId=e["id"], communityCode=e.get("communityCode", ""),
+                                             **flows[i % len(flows)])
                           for i, e in enumerate(egs)]
     return cfg
 
