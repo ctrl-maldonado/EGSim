@@ -104,6 +104,14 @@ Nicht vom Simulator auslösbar ist alles, was eure Plattform entscheidet: Reserv
 Settlement schlägt fehl (`FAILED`), Token läuft nach einer Stunde ab. Das testet ihr mit Testeinstellungen in der
 Plattform. EGSim prüft dann, ob Zuteilungen und Trades dazu passen.
 
+## Vertragsstand
+
+`contract/Datenvertrag.yaml` ist die **korrigierte Fassung 0.2 vom 19.11.2026**. Gegenüber dem Stand vom 16.11. prüft EGSim zusätzlich:
+
+- **Marktpreise:** `buyPriceEurPerKwh`, `sellPriceEurPerKwh` und `reservePriceEurPerKwh` sind Pflicht und nie `null` (Schema und Marktprüfung).
+- **`close`:** Jede Antwort, auch eine Wiederholung oder ein paralleler Aufruf, ist `200` bei `SETTLED` und `202` bei `CLOSED`.
+- **POS-08:** `PUT` eines Bedarfs mit Preisvorstellung ergibt `400 VALIDATION_FAILED`, und die Position bleibt unverändert (Menge und Preis werden danach nachgelesen).
+
 ## Schema-Prüfung
 
 Jede Antwort der Plattform wird gegen die Schemas des Datenvertrags geprüft (`contract/Datenvertrag.yaml`, daraus
@@ -198,7 +206,7 @@ aus Umgebungsvariablen gelesen, so müssen keine Secrets in der Datei stehen.
 
 ## Annahmen zum Datenvertrag (bitte abstimmen)
 
-1. **Markt anlegen:** Dafür gibt es keinen Endpoint. EGSim setzt voraus, dass der Markt existiert.
+1. **Markt anlegen:** Dafür gibt es keinen Endpoint. Seit der korrigierten Fassung vom 19.11. regelt der Vertrag das als Betreiberprozess: Bis der Markt konfiguriert ist, antworten `GET /markets/{deliveryDate}` und `POST /positions` mit `404 MARKET_NOT_FOUND`. EGSim setzt voraus, dass der Markt existiert.
 2. **Liefertag in der Vergangenheit ohne Markt:** Laut Prüfreihenfolge 404 vor 422. `VAL-13` akzeptiert beides.
 3. **Unbekannte vs. fremde EG-ID:** 404 für unbekannt, 403 für fremd (Prüfreihenfolge).
 4. **`PUT /positions/{id}` ohne Preisvorstellung:** Ob sie entfernt oder behalten wird, ist offen. EGSim schickt sie immer mit.

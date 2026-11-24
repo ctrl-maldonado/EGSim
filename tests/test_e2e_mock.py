@@ -257,3 +257,51 @@ def test_ui_passwortschutz(tmp_path):
         assert urllib.request.urlopen(req).status == 200
     finally:
         ui.shutdown()
+
+
+# --- Vertrag 0.2, korrigierte Fassung vom 19.11.2026 -------------------------------------------------------------
+
+class BedarfTeilweiseGeaendert(MockPlatform):
+    """Meldet bei PUT eines Bedarfs mit Preisvorstellung 400, speichert die neue Menge aber trotzdem."""
+
+    def h_put_position(self, raw_id, q, h, raw):
+        role, ec, _ = self._auth(h)
+        p = self.positions.get(raw_id)
+        b = json.loads(raw) if raw else {}
+        if p and p["type"] == "DEMAND" and b.get("priceExpectationEurPerKwh") is not None:
+            p["quantityKwh"] = Decimal(str(b["quantityKwh"]))
+            raise ApiErr("VALIDATION_FAILED")
+        return super().h_put_position(raw_id, q, h, raw)
+
+
+def test_bedarf_mit_preis_bleibt_unveraendert():
+    p = BedarfTeilweiseGeaendert()
+    srv, raw, d = _setup(p)
+    try:
+        rep = Simulator(parse_config(raw)).run()
+    finally:
+        srv.shutdown()
+    pos08 = next(c for c in rep["checks"] if c["id"] == "POS-08")
+    assert pos08["result"] == "FAIL" and "Position geändert" in (pos08.get("note") or "")
+
+
+def test_bedarf_mit_preis_korrekt_abgelehnt():
+    p = MockPlatform()
+    srv, raw, d = _setup(p)
+    try:
+        rep = Simulator(parse_config(raw)).run()
+    finally:
+        srv.shutdown()
+    assert next(c for c in rep["checks"] if c["id"] == "POS-08")["result"] == "PASS"
+
+
+def test_marktpreis_null_wird_erkannt():
+    p = MockPlatform()
+    srv, raw, d = _setup(p, n=1)
+    p.markets[d]["prices"]["reservePriceEurPerKwh"] = None
+    try:
+        rep = Simulator(parse_config(raw)).run()
+    finally:
+        srv.shutdown()
+    msgs = [f["message"] for f in rep["findings"] if f["severity"] == "error"]
+    assert any("reservePriceEurPerKwh" in m for m in msgs), msgs
